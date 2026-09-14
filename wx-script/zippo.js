@@ -75,7 +75,7 @@ const qlNotify = { sendNotify: _sendQingLongNotify, send: _sendQingLongNotify };
 // cron: 44 8 * * *
 /*
 ------------------------------------------
-@Description: zippo会员 - 微信小程序静默登录 + 每日签到
+@Description: zippo会员 - 微信小程序静默登录 + 每日签到/会员任务
 ------------------------------------------
 变量名：zippo
 变量值：yyb_go 存活账号的 openid/账号标识，多账号用 & 或换行分隔（可加 #备注）
@@ -95,6 +95,10 @@ const qlNotify = { sendNotify: _sendQingLongNotify, send: _sendQingLongNotify };
   日历  GET  /api/daily-signin/month?month=YYYY-MM  -> days[].isSignIn（month 必须是 YYYY-MM，
           发 YYYY-MM-DD 会回 400 "month must be a Date instance"）(只读，脚本未用)
   签到  POST /api/daily-signin  {}  -> rewards[].count（每日 1 分，连签 7/30 天另有奖励）
+  任务  GET  /api/missions -> list[].missions[]；completes/receives 分别是完成/领取次数
+  浏览  POST /api/missions/records {code:"pageview",missionId}
+  收藏  POST /api/favorites {targetType:"sku",targetId:<任务 link 中 skuId>,favorited:true}
+  领奖  POST /api/missions/{id}/rewards {id} -> points/rewardValue
 ------------------------------------------
 */
 
@@ -193,6 +197,7 @@ const USER_AGENT =
 const EP_LOGIN = "/api/users/auth";
 const EP_SIGN = "/api/daily-signin";
 const EP_USER = "/api/users/profile";
+const EP_MISSIONS = "/api/missions";
 
 const wechat = new WeChatServer({ appid: MINI_APP_ID });
 
@@ -362,6 +367,88 @@ class Task {
         this.log(`❌ 签到失败: ${msgOf(res)}`);
     }
 
+    async getDailyMissions() {
+        const res = await this.request(EP_MISSIONS, {}, true, "GET");
+        if (!isOk(res)) throw new Error(`读取会员任务失败: ${msgOf(res)}`);
+        const groups = Array.isArray(res?.list) ? res.list : [];
+        const daily = groups.find((group) => group?.type === "daily");
+        return Array.isArray(daily?.missions) ? daily.missions : [];
+    }
+
+    missionPending(mission) {
+        return Number(mission?.completes || 0) < Number(mission?.times || 1);
+    }
+
+    rewardPending(mission) {
+        return Number(mission?.completes || 0) > Number(mission?.receives || 0);
+    }
+
+    async claimMissionReward(mission, label, forceAttempt = false) {
+        if (!mission?.id) return this.log(`⚠️ ${label}缺少任务 ID，无法领奖`);
+        if (!forceAttempt && !this.rewardPending(mission)) {
+            const done = Number(mission?.completes || 0);
+            const received = Number(mission?.receives || 0);
+            return this.log(done > 0 && received >= done ? `✅ ${label}奖励已领取` : `⚠️ ${label}尚未完成，暂不可领取`);
+        }
+        const res = await this.request(`/api/missions/${mission.id}/rewards`, { id: mission.id });
+        if (isOk(res)) {
+            const points = res?.points ?? res?.rewardValue ?? mission?.rewardValue;
+            return this.log(`✅ ${label}奖励领取成功${points !== undefined ? `（+${points}积分）` : ""}`);
+        }
+        const message = msgOf(res);
+        if (isAlreadyDone(message) || /领取过|已领取|already.*receiv/i.test(message)) {
+            return this.log(`✅ ${label}奖励已领取（${message}）`);
+        }
+        this.log(`⚠️ ${label}奖励领取未成功: ${message}`);
+    }
+
+    async completePageview(mission) {
+        if (!this.missionPending(mission)) return this.claimMissionReward(mission, "浏览上新");
+        const res = await this.request("/api/missions/records", { code: mission.code || "pageview", missionId: mission.id });
+        if (!isOk(res)) {
+            const message = msgOf(res);
+            if (!isAlreadyDone(message)) return this.log(`❌ 浏览上新失败: ${message}`);
+        }
+        this.log("✅ 浏览上新已完成");
+        const current = (await this.getDailyMissions()).find((item) => item?.code === "pageview") || mission;
+        await this.claimMissionReward(current, "浏览上新");
+    }
+
+    async completeGoodsFavorite(mission) {
+        if (!this.missionPending(mission)) return this.claimMissionReward(mission, "收藏商品");
+        const link = String(mission?.link || "");
+        const skuId = link.match(/[?&]skuId=([^&]+)/i)?.[1];
+        if (!skuId) return this.log("❌ 收藏商品失败: 任务链接未提供 skuId");
+        const res = await this.request("/api/favorites", { targetType: "sku", targetId: decodeURIComponent(skuId), favorited: true });
+        if (!isOk(res)) {
+            const message = msgOf(res);
+            if (!isAlreadyDone(message)) return this.log(`❌ 收藏商品失败: ${message}`);
+        }
+        this.log("✅ 收藏商品已完成");
+        const current = (await this.getDailyMissions()).find((item) => item?.code === "goodsfav") || mission;
+        await this.claimMissionReward(current, "收藏商品");
+    }
+
+    async runMissions() {
+        let missions = await this.getDailyMissions();
+        const pageview = missions.find((item) => item?.code === "pageview");
+        const goodsfav = missions.find((item) => item?.code === "goodsfav");
+        if (pageview) await this.completePageview(pageview);
+        else this.log("⚠️ 未找到浏览上新任务");
+        if (goodsfav) await this.completeGoodsFavorite(goodsfav);
+        else this.log("⚠️ 未找到收藏商品任务");
+
+        missions = await this.getDailyMissions();
+        const invite = missions.find((item) => item?.code === "invitemember");
+        if (invite) {
+            const alreadyReceived = Number(invite?.receives || 0) >= Number(invite?.completes || 0) && Number(invite?.receives || 0) > 0;
+            if (alreadyReceived) this.log("✅ 邀请好友奖励今日已领取");
+            else await this.claimMissionReward(invite, "邀请好友", true);
+        } else {
+            this.log("⚠️ 未找到邀请好友任务");
+        }
+    }
+
     async run() {
         if (!this.account.openid) {
             this.log("跳过：变量值里没有 openid");
@@ -371,6 +458,7 @@ class Task {
             await this.ensureLogin();
             await this.queryUser();
             await this.sign();
+            await this.runMissions();
         } catch (e) {
             this.log(`执行失败: ${e.message || e}`);
         }
