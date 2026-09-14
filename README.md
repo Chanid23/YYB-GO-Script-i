@@ -52,6 +52,13 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 长虹智慧家 | `chzhjj.py` |
 | 创维 | `cw.js` |
 | QQ音乐签到 | `qqmusic.py` |
+| 爱裹旧衣回收 | `agyh.js` |
+| 白鲸鱼旧衣服回收 | `bjy.py` |
+| 漓泉啤酒生态营地 | `lqpj.py` |
+| 拾绿旧衣回收 | `sljy.js` |
+| 太平洋蓝医保 | `tpylyb.py` |
+| 丸丫甄选 | `wyzx.js` |
+| Zippo会员 | `zippo.js` |
 
 使用前请先部署 YYB-Go-Enhanced，并按各脚本文件头部说明配置 `YYB_SERVER` 等环境变量。
 
