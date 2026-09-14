@@ -123,7 +123,7 @@ class WeChatServer {
 
 class Env {
     constructor(name) { this.name = name; this.userList = []; this.userIdx = 1; this.userCount = 0; this.logs = []; const originalLog = console.log; console.log = (...args) => { this.logs.push(args.join(" ")); originalLog.apply(console, args); }; }
-    log(...args) { console.log(...args); this.logs.push(args.join(" ")); }
+    log(...args) { console.log(...args); }
     async wait(minMs, maxMs) { const ms = maxMs ? Math.floor(minMs + Math.random() * (maxMs - minMs)) : minMs; await new Promise(r => setTimeout(r, ms)); }
     async checkEnv(ckName) {
         const list = await global.resolveAccounts(ckName);
