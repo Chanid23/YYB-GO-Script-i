@@ -73,6 +73,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 联通 | `lt.py` |
 | 网易云音乐签到脚本 | `netease_full.js` |
 | 微软积分 | `Microsoft Rewards.js` |
+| 雨云自动签到 | `Rainyun.py` |
 | 无忧计划 | `wyjh.py` |
 | 移动云盘 | `ydyp.py` |
 | 元宝AI打卡 | `yb.py` |
