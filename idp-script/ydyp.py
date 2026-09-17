@@ -3,7 +3,7 @@
 # name: 移动云盘
 # cron: 0 0 8,16,20 * * *
 """
-移动云盘自动签到 v5.0.6
+移动云盘自动签到 v5.0.7
 
 包含以下功能:
 1. 每日自动签到 (签到/抽奖/摇一摇/新版云朵领取)
@@ -12,6 +12,13 @@
 4. 临时文件智能清理与详细日志推送
 
 更新说明:
+
+### 20260917
+v5.0.7:
+- 修复历史缓存覆盖最新 Authorization 导致的鉴权失败。
+- 适配 querySpecTokenV2 鉴权接口，并保留旧接口回退。
+- 接入青龙 notify.py 通知模块。
+- 删除已过期的公众号签到、摇一摇和抽奖任务。
 
 ### 20260605
 v5.0.6:
@@ -55,7 +62,7 @@ except ImportError:
     AES = None
     pad = None
 
-SCRIPT_VERSION = '5.0.6'
+SCRIPT_VERSION = '5.0.7'
 
 TOKEN_STORAGE_FILENAME = 'ydyp_token_storage.json'
 DEVICE_ID_STORAGE_FILENAME = ''
@@ -318,28 +325,46 @@ def print_storage_path_notice():
 # 发送通知
 def load_send():
     cur_path = path.abspath(path.dirname(__file__))
-    notify_file = cur_path + "/notify.py"
+    notify_dirs = [cur_path, '/ql/data/scripts', '/ql/scripts']
 
-    if path.exists(notify_file):
+    for notify_dir in notify_dirs:
+        notify_file = path.join(notify_dir, 'notify.py')
+        if not path.isfile(notify_file):
+            continue
         try:
             import sys
 
-            if cur_path not in sys.path:
-                sys.path.insert(0, cur_path)
+            if notify_dir not in sys.path:
+                sys.path.insert(0, notify_dir)
             from notify import send
 
-            print("加载通知服务成功！")
+            print(f"加载青龙通知模块成功: {notify_file}")
             return send
         except Exception as e:
-            print(f"加载通知服务失败: {e}")
-    else:
-        print("加载通知服务失败: notify.py不存在")
+            print(f"加载青龙通知模块失败: {e}")
 
+    print("加载青龙通知模块失败: 未找到 notify.py")
     return False
+
+
+def send_notification(title, content):
+    """通知是旁路能力，发送失败不影响主任务结果。"""
+    send = load_send()
+    if not send:
+        return False
+    try:
+        send(title, content)
+        print("青龙通知请求已提交")
+        return True
+    except Exception as e:
+        print(f"青龙通知发送失败: {e}")
+        return False
 
 
 class YP:
     def __init__(self, cookie):
+        self.account = ''
+        self.Authorization = None
         try:
             self.notebook_id = None
             self.note_token = None
@@ -369,6 +394,7 @@ class YP:
                 raise ValueError(f"⚠️ 变量值格式错误，需要: Authorization值#手机号")
 
             self.Authorization = normalize_authorization(parts[0])
+            self.configured_authorization = self.Authorization
             self.account = parts[1].strip()
             self.init_device_id = parts[2].strip() if len(parts) >= 3 else ''
             self.token_storage = load_token_storage()
@@ -411,7 +437,12 @@ class YP:
         return (self.token_storage.get('accounts') or {}).get(self.account, {}) or {}
 
     def load_persisted_authorization(self):
-        """加载已保存的 Authorization，优先从简易存储读取"""
+        """仅在环境变量未提供 Authorization 时使用缓存。
+
+        QingLong 环境变量是用户最新抓取的凭据，不能被历史缓存覆盖。
+        """
+        if normalize_authorization(getattr(self, 'configured_authorization', '')):
+            return
         # 优先从新版简易存储读取
         new_storage = get_token_info(self.account)
         stored_token = normalize_authorization(new_storage.get('token', ''))
@@ -588,10 +619,6 @@ class YP:
             self.signin_status()
             self.click()
             self.get_tasklist(url='sign_in_3', app_type='cloud_app')
-            self.log(f'\n📰 公众号任务')
-            self.wxsign()
-            self.shake()
-            self.surplus_num()
             self.log(f'\n🔥 热门任务')
             self.backup_cloud()
             self.log(f'\n📧 139邮箱任务')
@@ -1478,14 +1505,32 @@ class YP:
         time.sleep(delay)
 
     def sso(self):
-        sso_url = 'https://orches.yun.139.com/orchestration/auth-rebuild/token/v1.0/querySpecToken'
-        sso_headers = {'Authorization': self.Authorization, 'User-Agent': ua, 'Content-Type': 'application/json', 'Accept': '*/*', 'Host': 'orches.yun.139.com'}
-        sso_payload = {"account": self.account, "toSourceId": "001005"}
-        sso_data = self.request_json(sso_url, headers=sso_headers, data=sso_payload, method='POST')
+        # 2026-09 HAR 中网页端使用 querySpecTokenV2；保留旧编排接口回退。
+        common_headers = {
+            'Authorization': self.Authorization,
+            'User-Agent': ua,
+            'Content-Type': 'application/json',
+            'Accept': '*/*',
+        }
+        sso_data = self.request_json(
+            'https://user-njs.yun.139.com/user/querySpecTokenV2',
+            headers={**common_headers, 'Host': 'user-njs.yun.139.com'},
+            data={"toSourceId": "001005"},
+            method='POST',
+            retries=1,
+        )
+        if not sso_data or not sso_data.get('success') or not isinstance(sso_data.get('data'), dict) or not sso_data['data'].get('token'):
+            sso_data = self.request_json(
+                'https://orches.yun.139.com/orchestration/auth-rebuild/token/v1.0/querySpecToken',
+                headers={**common_headers, 'Host': 'orches.yun.139.com'},
+                data={"account": self.account, "toSourceId": "001005"},
+                method='POST',
+                retries=1,
+            )
         if not sso_data:
             self.log('刷新Token失败: 接口无响应')
             return None
-        if sso_data['success']:
+        if sso_data.get('success') and isinstance(sso_data.get('data'), dict) and sso_data['data'].get('token'):
             refresh_token = sso_data['data']['token']
             self.sso_token = refresh_token
             return refresh_token
@@ -1764,61 +1809,6 @@ class YP:
         return note_id
 
     @catch_errors
-    def wxsign(self):
-        self.sleep()
-        url = 'https://caiyun.feixin.10086.cn/market/playoffic/followSignInfo?isWx=true'
-        return_data = self.send_request(url, headers=self.jwtHeaders, cookies=self.cookies).json()
-
-        if return_data['msg'] != 'success':
-            return self.log(return_data['msg'])
-        if not return_data['result'].get('todaySignIn'):
-            return self.log('❌签到失败,可能未绑定公众号')
-        return self.log('✅公众号签到成功')
-
-    def shake(self):
-        url = "https://caiyun.feixin.10086.cn:7071/market/shake-server/shake/shakeIt?flag=1"
-        successful_shakes = 0
-
-        try:
-            for _ in range(self.click_num):
-                return_data = self.send_request(url=url, cookies=self.cookies, headers=self.jwtHeaders, method='POST').json()
-                time.sleep(1)
-                shake_prize_config = return_data["result"].get("shakePrizeconfig")
-
-                if shake_prize_config:
-                    self.log(f"🎉摇一摇获得: {shake_prize_config['name']}")
-                    successful_shakes += 1
-        except Exception as e:
-            print(f'错误信息: {e}')
-        if successful_shakes == 0:
-            print(f'❌未摇中 x {self.click_num}')
-
-    @catch_errors
-    def surplus_num(self):
-        self.sleep()
-        draw_info_url = 'https://caiyun.feixin.10086.cn/market/playoffic/drawInfo'
-        draw_url = "https://caiyun.feixin.10086.cn/market/playoffic/draw"
-
-        draw_info_data = self.send_request(draw_info_url, headers=self.jwtHeaders).json()
-
-        if draw_info_data.get('msg') == 'success':
-            remain_num = draw_info_data['result'].get('surplusNumber', 0)
-            self.log(f'剩余抽奖次数{remain_num}')
-            if remain_num > 50 - self.draw:
-                for _ in range(self.draw):
-                    self.sleep()
-                    draw_data = self.send_request(url=draw_url, headers=self.jwtHeaders).json()
-
-                    if draw_data.get("code") == 0:
-                        prize_name = draw_data["result"].get("prizeName", "")
-                        self.log("✅抽奖成功，获得:" + prize_name)
-                    else:
-                        print("❌抽奖失败")
-
-        else:
-            self.log(f"抽奖查询失败: {draw_info_data.get('msg')}")
-
-    @catch_errors
     def do_fruit_task(self, task_name, task_id, water_num):
         self.log(f'-去完成: {task_name}')
         do_task_url = f'{self.fruit_url}task/doTask.do?taskId={task_id}'
@@ -2000,14 +1990,15 @@ if __name__ == "__main__":
         print(f'⛔️未获取到ck变量：请检查变量 {env_name} 是否填写')
         exit(0)
 
-    cookies = re.split(r'[&\n]', token)
+    cookies = [item.strip() for item in re.split(r'[&\n]', token) if item.strip()]
     print_startup_info(len(cookies))
     print_device_id_notice()
     print_storage_path_notice()
 
     for i, account_info in enumerate(cookies, start=1):
         yp_instance = YP(account_info)
-        print(f"\n======== ▷ 第 {i} 个账号 【{yp_instance.account}】◁ ========")
+        account_label = yp_instance.account or f'格式错误-{i}'
+        print(f"\n======== ▷ 第 {i} 个账号 【{account_label}】◁ ========")
 
         if not yp_instance.Authorization:
             print(f"⛔️ 账号 {i} 无效，跳过执行")
@@ -2033,7 +2024,4 @@ if __name__ == "__main__":
     msg = msg.replace('-', ' ').replace('.', ' ').replace('!', '！').replace('(', '（').replace(')', '）')
     msg = msg.replace('_', ' ').replace('=', ' ').replace('~', ' ').replace('{', ' ').replace('}', ' ').replace('|', ' ')
 
-    send = load_send()
-
-    if send:
-        send('中国移动云盘任务信息', msg)
+    send_notification('中国移动云盘任务信息', msg or '任务已执行，本次无汇总数据')
