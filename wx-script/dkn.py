@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-迪卡侬每日签到 9.17
+name: 迪卡侬签到
+cron: 58 8 * * *
 
 依赖：
   pip install requests
