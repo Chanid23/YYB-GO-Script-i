@@ -61,6 +61,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 太平洋蓝医保 | `tpylyb.py` |
 | 丸丫甄选 | `wyzx.js` |
 | Zippo会员 | `zippo.js` |
+| 迪卡侬 | `dkn.py` |
 
 使用前请先部署 YYB-Go-Enhanced，并按各脚本文件头部说明配置 `YYB_SERVER` 等环境变量。
 
