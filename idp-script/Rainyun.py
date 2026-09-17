@@ -5,6 +5,13 @@
 # 环境变量名称：RAINYUN
 # 单账户填写：账号#密码
 # 多账户填写：账号1#密码1@账号2#密码2
+#
+# 验证码识别 Token 配置教程：
+# 1. 打开 https://mf.yinxiaoxing.dpdns.org/ 并登录。
+# 2. 在“我的 Token”中申请新 Token，求解系统选择“腾讯图形点选”。
+# 3. 进入青龙面板“环境变量”，新建变量 OCR_TOKEN，值填写申请到的 Token。
+# 4. CAPTCHA_API_URL 可不配置，脚本默认使用上述验证码求解服务。
+
 """
 雨云(Rainyun)自动签到脚本
 依赖：requests, opencv-python, numpy, pillow
@@ -75,8 +82,8 @@ CAPTCHA_AID   = "2039519451"
 # ====== 青龙面板配置区（直接修改这里）======
 # 验证码求解 API 地址
 CAPTCHA_API_URL = os.environ.get("CAPTCHA_API_URL", "https://mf.yinxiaoxing.dpdns.org/").rstrip("/")
-# 人机求解系统 Token（网页端申请  腾讯图形点选  后填到这里，也可用青龙环境变量 OCR_TOKEN 覆盖）
-OCR_TOKEN = os.environ.get("OCR_TOKEN", "ocr_f315317b2ee2ec****")
+# 人机求解系统 Token（必须通过青龙环境变量 OCR_TOKEN 配置，脚本自身不保存 Token）
+OCR_TOKEN = os.environ.get("OCR_TOKEN", "").strip()
 # 雨云账号列表（支持多账号，格式: [("备注名", "用户名", "密码"), ...]）
 ACCOUNTS = [
     ("账号1", "用户名1", "用户名1密码"),
@@ -1848,6 +1855,9 @@ class RainyunSigner:
 
         # 优先通过远程 API 求解验证码
         if CAPTCHA_API_URL:
+            if not OCR_TOKEN:
+                log("  ❌ 未配置验证码识别 Token，请在青龙环境变量中添加 OCR_TOKEN")
+                return False
             log(f"  🌐 通过 API 求解验证码: {CAPTCHA_API_URL}")
             try:
                 # 提取当前 session 的 cookies 传给求解服务
