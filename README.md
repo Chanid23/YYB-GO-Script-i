@@ -67,6 +67,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 中华保签到 | `zhb.py` |
 | 中国移动10086+签到 | `yd10086.py` |
 | 南方航空签到 | `nfhk.py` |
+| 哈啰出行 | `hlcx.py` |
 
 使用前请先部署 YYB-Go-Enhanced，并按各脚本文件头部说明配置 `YYB_SERVER` 等环境变量。
 
