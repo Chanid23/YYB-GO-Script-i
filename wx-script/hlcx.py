@@ -4,7 +4,7 @@
 # cron: 35 8 * * *
 """
 name: 哈啰出行签到
-cron: 35 8 * * *
+cron: 35 9 * * *
 
 哈啰出行微信小程序每日签到与奖励金查询，基于 YYB-Go-Enhanced 自动取码登录。
 
@@ -16,6 +16,7 @@ cron: 35 8 * * *
 
 功能仅包含：静默登录、每日签到、签到前后奖励金对比、钱包余额查询与通知。
 """
+作者：lcmovie https://github.com/lcmovie
 
 from __future__ import annotations
 
