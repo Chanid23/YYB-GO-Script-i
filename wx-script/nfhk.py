@@ -4,7 +4,7 @@
 # cron: 6 8 * * *
 """
 name: 南方航空签到
-cron: 6 8 * * *
+cron: 16 9 * * *
 
 中国南方航空（明珠会员）微信小程序「天天签到」每日签到 + 连续签到奖励（抽奖机会 / 里程），
 基于 YYB-Go-Enhanced 自动取码登录，全程无需抓包。
@@ -29,96 +29,6 @@ cron: 6 8 * * *
       -> 复查里程与金币 -> 汇总通知。多账号串行，非明珠会员归入「跳过」不计失败。
 
 ────────────────────────────────────────────────────────────────────────────
-登录链路（全部由小程序包 + 签到 H5 静态分析复现，无任何抓包）
-────────────────────────────────────────────────────────────────────────────
-小程序 AppID  wx729238547ac7a14c      接口域  https://wxapi.csair.com
-签到业务在 H5：https://wxapi.csair.com/h5/sign/#/signTools （react SPA，
-小程序「我 → 签到」用 web-view 打开它，登录态通过 URL 的 token 参数传入）
-
-  1. YYB   POST /wxapp/getCode                        -> wx.login code + 微信 openid
-  2. 南航  POST /mini/api/login/login                 -> sessionId / unionId / openId
-           ?appid=wx729238547ac7a14c&wxchannel=wxopen&envVersion=release
-           请求头 sessionId="" / channel=ecsair / activityChannel=1 / unnecessaryParam=""
-           body   {"code": <code>}
-  3. 南航  POST /mini/api/login/isLogin               -> 明珠会员信息（含 token、usefulMileage 里程）
-           请求头 sessionId=<上一步 sessionId>
-           body   {"ssoKey": <unionId>, "clientType": "PC"}
-  4. 拿到的 member.token 就是签到 H5 的登录态：H5 把它写成 Cookie
-           TOKEN=<token> 与 cs1246643sso=<token>（两个都必须带，缺一个会报 S0001 登录凭证为空）
-
-────────────────────────────────────────────────────────────────────────────
-签到 H5 接口（域 https://wxapi.csair.com，统一 query: type=APPTYPE&chanel=ss&lang=zh）
-────────────────────────────────────────────────────────────────────────────
-  POST /marketing-tools/activity/load            {activityType:"sign", channel:"mini"} 活动配置
-        -> data.activityDtoList[].signActivity：activityName「天天签到」、
-           rewardType=serialSign、signTimeRange=08:00:00-23:59:59、
-           pinpointAwardConfig = 精准里程奖励日（指定日期签到额外给里程）
-  GET  /marketing-tools/sign/getSignCalendarNew  ?startQueryDate=YYYYMM01&endQueryDate=YYYYMM末
-        -> data.dateList 该月已签日期（只返回所查月份）、awardDisplay = 连签奖励阶梯
-           阶梯元素：{dateOfAward, rewardType:"serialSign", prizeType:
-                     "lotteryAward"（抽奖机会）|"mileageAward"（直接给里程）,
-                     num, isGain}
-  GET  /marketing-tools/sign/getSignProgress     已废弃，signSerial 恒为 null
-  GET  /marketing-tools/sign/getUserAwardContent 奖励条件进度（如「抽奖机会（连签3天）」）
-  GET  /marketing-tools/sign/getSignUserCoinBalance / POST .../getSignGoldCountNum {pageNo:1} 金币
-        -> 上述账号金币体系未开通，balance 恒为 "--"，实际积分就是里程
-  POST /marketing-tools/award/awardList          {activityType:"sign", awardStatus, pageNum}
-        awardStatus ∈ {all, waitReceive, received, expired}
-  POST /marketing-tools/award/getAward           {activityType:"sign", signUserRewardId} 领奖
-  POST /marketing-tools/activity/join            {activityType:"sign", channel:"mini"} 执行签到
-        respCode=0000 且 data.code ∈ {00A1 本次有奖, 00A2 成功, 00A0/00A3 本档无额外奖励}
-        respCode ∈ {S2001 今日已签, 0130/0131/0140/0141/0150/0151} 为提示类，H5 也只弹文案
-
-────────────────────────────────────────────────────────────────────────────
-关于「连续签到抽奖」（如实说明能力边界）
-────────────────────────────────────────────────────────────────────────────
-  活动「天天签到」是 serialSign（连续/累计签到）玩法，连签到达指定天数后由服务端
-  在 awardList 里下发一条待领奖品：
-      {"awardType":"lotteryAward", "awardName":"抽奖机会", "signDay":"3",
-       "awardDesc":"{...lotteryUrl...}", "awardId":..., "activityId":..., "id":...}
-
-  抽奖链路（H5 home chunk 的 signAwardJump / received 复现）：
-    1. POST award/getAward {signUserRewardId: id}
-       成功条件：respCode=0000 且 data.code=0000
-    2. 若奖品是抽奖机会，H5 会拼出跳转地址并交给小程序打开：
-         url = <lotteryUrl> &signInGiftId=<awardId>
-                            &signInActivityId=<activityId> &rewardId=<id>
-       lotteryUrl 有两个来源（两处代码各用一个）：奖品对象顶层的 `lotteryUrl`，
-       或 `JSON.parse(awardDesc).lotteryUrl`；跳转字段另有 microJumpPage/microJumpLink。
-       最终动作是 window.wx.miniProgram.navigateTo({url})，即**小程序内的一个页面**，
-       转盘本身在那个页面里（通常还要看激励视频才给转）。
-
-  因此本脚本对抽奖的能力边界是：**自动把「抽奖机会」领到手，并把抽奖入口原样打印出来**
-  （通知里也会带），点一下即可参与。转盘本身在微信内的页面里、且带激励视频门槛，
-  无法在青龙里代跑；脚本不会伪造任何抽奖结果。
-  连签第 3 天（本活动 2026-09-23）首次拿到抽奖机会时，日志里会出现完整入口地址。
-
-────────────────────────────────────────────────────────────────────────────
-实测记录（2026-09-21，青龙容器 ql2）
-────────────────────────────────────────────────────────────────────────────
-  · 5 个账号：1/3/5 是明珠会员且签到成功，2/4 未注册 → 跳过（不算失败）
-  · 定时任务 id=1127（task nfhk.py，6 8 * * *），走任务通道跑通，PushPlus 通知送达
-  · 注意：面板用 command-run 手工跑不会加载任务环境变量，需要在命令里显式带上
-
-────────────────────────────────────────────────────────────────────────────
-活动规则（2026-09 期，已与官方规则弹窗逐条核对）
-────────────────────────────────────────────────────────────────────────────
-  官方弹窗原文：「9月签到新玩法上线！每日 8:00—23:59:59 签到。
-    9.1 签到可获得 2 里程；9.15 签到可获得 8 里程；9.28 签到可获得 88 里程；
-    连续签到 3 天，可获得抽奖机会，有机会获得 6000 里程、666 里程、66 里程、
-    5天+30%里程奖励券、2 里程。」
-
-  与接口数据的对应关系（全部由 activity/load 下发，脚本不硬编码任何一条）：
-    · 签到时段 8:00–23:59:59  -> signActivity.signTimeRange = "08:00:00-23:59:59"
-    · 9.1/9.15/9.28 里程      -> signActivity.pinpointAwardConfig
-                                 （3 条 mileageAward，分别为 2 / 8 / 88）
-    · 连签 3 天得抽奖机会      -> getSignCalendarNew.awardDisplay 里
-                                 dateOfAward=2026-09-23, prizeType=lotteryAward
-                                 （同月还有 09-26 / 09-29 两个抽奖档、09-28 里程档）
-  ⚠️ 弹窗里那份**奖池清单（6000/666/66 里程、5天+30%里程券、2 里程）接口并不下发**
-     （activity/load 的 popContent / tagConfig / shareRewardConfig 全为 null，
-      H5 全部 15 个 js chunk 里也搜不到这些数字，属运营侧图文）。
-     所以脚本只认服务端返回的奖品，绝不猜测或写死奖池 —— 中奖结果以服务端为准。
 
 作者：lcmovie https://github.com/lcmovie
 """
