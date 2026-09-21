@@ -57,6 +57,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 闲单汇 | `xdh.py` |
 | 爱裹旧衣回收 | `agyh.js` |
 | 白鲸鱼旧衣服回收 | `bjy.py` |
+| 回收猿签到 | `hsy.py` |
 | 漓泉啤酒生态营地 | `lqpj.py` |
 | 拾绿旧衣回收 | `sljy.js` |
 | 太平洋蓝医保 | `tpylyb.py` |
