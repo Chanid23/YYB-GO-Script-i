@@ -66,6 +66,9 @@ function loadDependencies() {
     }
     try {
         axiosRetry = require('axios-retry')
+        // axios-retry v4 采用 ESM/CJS 双包导出，require 得到的是模块对象，
+        // 真正的函数挂在 .default 上，直接用会报 "axiosRetry is not a function"
+        if (axiosRetry && axiosRetry.default) axiosRetry = axiosRetry.default
     } catch {
         // axios-retry 可选，缺失时使用内置重试
         axiosRetry = null
