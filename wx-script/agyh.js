@@ -41,7 +41,7 @@ async function getSingleCode(appId, identifier) {
 
     const response = await axios.post(`${route.server}/wxapp/getCode`,
         { ref: route.ref, app_id: appId },
-        { timeout: 30000, headers });
+        { timeout: 30000, headers: headers });
     const body = response.data;
     if (!body || Number(body.code) !== 0) {
         throw new Error(`/wxapp/getCode 返回失败：${body?.msg || body?.message || JSON.stringify(body)}`);
