@@ -5,12 +5,14 @@ name: 微信支付提现笔笔省
 入口: 微信小程序 (https://a.c1ns.cn/X3ucP)
 功能: 领券、查询
 变量: YYB_SERVER (YYB-Go-Enhanced地址@账号ref，多个账号换行分割)
+        YYB_API_KEY / YYB_PROTOCOL_TOKEN (YYB-Go-Enhanced 开启协议鉴权时填写，二选一)
         PROXY_API_URL (代理api，返回一条txt文本，内容为代理ip:端口)
 定时: 一天两次
 cron: 10 11,12 * * *
 ------------更新日志------------
 2025/8/21   V1.0    初始化脚本
 2026/8/7    V2.0    适配YYB-Go-Enhanced及青龙单文件运行
+2026/10/11  V2.1    修复服务端开启协议鉴权后取码 401：协议请求补充 Authorization 头
 """
 
 import json
@@ -25,6 +27,12 @@ import traceback
 import ssl
 import sys
 from datetime import datetime, timedelta
+
+
+def _yyb_auth_headers():
+    """YYB-Go-Enhanced 协议接口鉴权头；未配置令牌时返回空字典，兼容未开启鉴权的服务端。"""
+    _token = (os.getenv("YYB_API_KEY") or os.getenv("YYB_PROTOCOL_TOKEN") or "").strip()
+    return {"Authorization": "Bearer " + _token} if _token else {}
 
 MULTI_ACCOUNT_SPLIT = ["\n", "@"] # 分隔符列表
 MULTI_ACCOUNT_PROXY = False # 是否使用多账号代理，默认不使用，True则使用多账号代理
@@ -62,6 +70,7 @@ class YYBGoEnhancedAdapter:
             session.trust_env = False  # 取码访问Docker内网，不继承青龙代理
             response = session.post(
                 f"{server}/wxapp/getCode",
+                headers=_yyb_auth_headers(),
                 json={"ref": ref, "app_id": self.wx_appid},
                 timeout=20,
             )

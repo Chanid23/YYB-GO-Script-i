@@ -6,6 +6,7 @@ name:  中通快递
 入口: 微信小程序
 功能: 签到
 变量: YYB_SERVER (YYB-Go服务地址@微信账号标识，多账号用换行分割)
+    YYB_API_KEY / YYB_PROTOCOL_TOKEN (YYB-Go-Enhanced 开启协议鉴权时填写，二选一)
     PROXY_API_URL (代理api，返回一条txt文本，内容为代理ip:端口)
 定时: 一天两次
 cron: 1 8,13 * * *
@@ -19,6 +20,7 @@ cron: 1 8,13 * * *
 2026/8/17   V2.0    移除 getCode 依赖，改用 YYB-Go-Enhanced 获取微信 code，更新登录协议
 2026/9/23   V2.1    增加签到前后积分查询，并清晰显示积分变化
 2026/9/23   V2.2    美化多账号通知，增加账号结果、积分变化和执行汇总
+2026/10/11  V2.3    修复服务端开启协议鉴权后取码 401：协议请求补充 Authorization 头
 """
 
 import random
@@ -29,6 +31,12 @@ import sys
 import logging
 import traceback
 from datetime import datetime
+
+
+def _yyb_auth_headers():
+    """YYB-Go-Enhanced 协议接口鉴权头；未配置令牌时返回空字典，兼容未开启鉴权的服务端。"""
+    _token = (os.getenv("YYB_API_KEY") or os.getenv("YYB_PROTOCOL_TOKEN") or "").strip()
+    return {"Authorization": "Bearer " + _token} if _token else {}
 
 MULTI_ACCOUNT_PROXY = False # 是否使用多账号代理，默认不使用，True则使用多账号代理
 NOTIFY = os.getenv("LY_NOTIFY") or False # 是否推送日志，默认不推送，True则推送
@@ -59,6 +67,7 @@ class AutoTask:
                 host = f"http://{host}"
             response = requests.post(
                 f"{host}/wxapp/getCode",
+                headers=_yyb_auth_headers(),
                 json={"ref": ref, "app_id": self.wx_appid},
                 timeout=20,
             )

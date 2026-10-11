@@ -12,6 +12,7 @@ QQ音乐签到 v1.2.0（YYB-Go-Enhanced 直连版）
    YYB_SERVER                                       必填，每行一个 地址@账号ref
    - 青龙与 YYB-Go 同属 qinglong_default 网络时使用：yyb-go:8000@账号ref
    - 多账号一行一个；脚本会逐行选择对应服务地址取 code
+   YYB_API_KEY / YYB_PROTOCOL_TOKEN               可选，YYB-Go-Enhanced 开启协议鉴权时填写，二选一
 
 2. 账号变量：
    WX_ID                                            可选，账号白名单
@@ -53,6 +54,12 @@ from urllib.parse import quote
 
 import requests
 import sys
+
+
+def _yyb_auth_headers():
+    """YYB-Go-Enhanced 协议接口鉴权头；未配置令牌时返回空字典，兼容未开启鉴权的服务端。"""
+    _token = (os.getenv("YYB_API_KEY") or os.getenv("YYB_PROTOCOL_TOKEN") or "").strip()
+    return {"Authorization": "Bearer " + _token} if _token else {}
 
 # 兼容青龙根目录、仓库子目录和本地运行时的通知模块查找路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -400,6 +407,7 @@ def get_code(wxid: str) -> str | None:
             print(f"🔐 [授权] YYB 获取 code（账号 {ACCOUNT_NAMES.get(wxid, mask(wxid))}）")
             response = direct_session().post(
                 f"{server}/wxapp/getCode",
+                headers=_yyb_auth_headers(),
                 json={"ref": wxid, "app_id": APPID},
                 timeout=30,
             )
