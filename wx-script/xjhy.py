@@ -13,6 +13,7 @@
   YYB_SERVER      YYB-Go-Enhanced 地址@账号ref，多账号一行一个
 
 选填：
+  YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
   WX_ID/WXIDXJ    只运行指定账号，格式：ref#备注，多账号换行或 & 分隔
                   未配置时自动读取 YYB_SERVER 中的全部账号ref
   WECHAT_SERVER   旧微信协议服务回退地址
@@ -337,6 +338,12 @@ class WxAdapter:
         if not entry and len({item['server'] for item in self._configured_yyb_entries()}) > 1:
             raise RuntimeError('无法确定账号对应的 YYB 服务，请用 地址@ref')
         yyb_server = entry["server"] if entry else self.yyb_server
+        headers = {
+            "Content-Type": "application/json"
+        }
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+        if api_key:
+            headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
         if not yyb_server:
             raise RuntimeError("未配置 YYB_SERVER")
         body = {
@@ -345,7 +352,7 @@ class WxAdapter:
         }
         if payload is not None:
             body["payload"] = payload
-        resp = self.session.post(f"{yyb_server}/wxapp/{endpoint}", json=body, timeout=30)
+        resp = self.session.post(f"{yyb_server}/wxapp/{endpoint}", json=body, timeout=30, headers=headers)
         if resp.status_code == 409:
             raise RuntimeError("账号 login_buffer 已过期，需要重新扫码登录")
         resp.raise_for_status()

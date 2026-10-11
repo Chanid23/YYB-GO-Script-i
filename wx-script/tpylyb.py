@@ -6,6 +6,7 @@
 name: 太平洋蓝医保
 Date: 2026-09-02
 YYB_SERVER：YYB-Go-Enhanced 路由，每行：地址@账号标识
+YYB_API_KEY:       启用 YYB_PROTOCOL_TOKEN 后配置
 账号自动从 yyb_go 拉取全部存活账号；WX_ID（或 lpzl_tpylyb）仅作为可选白名单过滤，留空即用全部
 cron: 28 6,19 * * *
 version: 2.3
@@ -68,8 +69,14 @@ def _yyb_route(identifier):
 def _yyb_call(endpoint, app_id, identifier):
     import requests as _requests
     route = _yyb_route(identifier)
+    headers = {
+            "Content-Type": "application/json"
+        }
+    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+    if api_key:
+        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
     response = _requests.post(route["server"] + endpoint,
-                              json={"ref": route["ref"], "app_id": app_id}, timeout=30)
+                              json={"ref": route["ref"], "app_id": app_id}, timeout=30, headers=headers)
     response.raise_for_status()
     body = response.json()
     if not isinstance(body, dict) or int(body.get("code", -1)) != 0:

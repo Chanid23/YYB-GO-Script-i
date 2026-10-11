@@ -5,7 +5,8 @@ name: 微信支付提现笔笔省
 入口: 微信小程序 (https://a.c1ns.cn/X3ucP)
 功能: 领券、查询
 变量: YYB_SERVER (YYB-Go-Enhanced地址@账号ref，多个账号换行分割)
-        PROXY_API_URL (代理api，返回一条txt文本，内容为代理ip:端口)
+      PROXY_API_URL (代理api，返回一条txt文本，内容为代理ip:端口)
+      YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
 定时: 一天两次
 cron: 10 11,12 * * *
 ------------更新日志------------
@@ -60,10 +61,17 @@ class YYBGoEnhancedAdapter:
             server, ref = self.parse_entry(entry)
             session = requests.Session()
             session.trust_env = False  # 取码访问Docker内网，不继承青龙代理
+            headers = {
+                "Content-Type": "application/json"
+            }
+            api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+            if api_key:
+                headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
             response = session.post(
                 f"{server}/wxapp/getCode",
                 json={"ref": ref, "app_id": self.wx_appid},
                 timeout=20,
+                headers=headers
             )
             response.raise_for_status()
             body = response.json()

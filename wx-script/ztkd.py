@@ -53,6 +53,12 @@ class AutoTask:
         self.log_msgs.append(formatted)
 
     def get_wx_code(self, server, ref):
+        headers = {
+            "Content-Type": "application/json"
+        }
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+        if api_key:
+            headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
         try:
             host = server.rstrip("/")
             if not host.startswith(("http://", "https://")):
@@ -61,6 +67,7 @@ class AutoTask:
                 f"{host}/wxapp/getCode",
                 json={"ref": ref, "app_id": self.wx_appid},
                 timeout=20,
+                headers=headers
             )
             response.raise_for_status()
             body = response.json()

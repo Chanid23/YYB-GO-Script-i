@@ -5,6 +5,7 @@
 #
 # 环境变量：
 #   YYB_SERVER   每行：地址@账号标识（例如 http://yyb-go:8000@1）
+#   YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
 #   HSY_NOTIFY   0 关闭青龙通知；默认 1
 #
 # 作者 lcmovie  https://github.com/lcmovie/YYB-GO-Script-i
@@ -91,7 +92,13 @@ def api(session, php, params, method="GET", data=None, signed=True):
 
 
 def yyb_code(server, ref):
-    response = requests.post(f"{server}/wxapp/getCode", json={"ref": ref, "app_id": APP_ID}, timeout=TIMEOUT)
+    headers = {
+            "Content-Type": "application/json"
+        }
+    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+    if api_key:
+        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
+    response = requests.post(f"{server}/wxapp/getCode", json={"ref": ref, "app_id": APP_ID}, timeout=TIMEOUT, headers=headers)
     response.raise_for_status()
     body = response.json()
     if int(body.get("code", -1)) != 0:

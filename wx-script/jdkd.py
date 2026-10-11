@@ -7,6 +7,7 @@ cron: 17 8 * * *
 青龙环境变量：
   YYB_SERVER  YYB-Go-Enhanced 地址@账号标识，多账号每行一条
               例：yyb-go:8000@1
+  YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
   JDEXPRESS_NOTIFY  1 推送（默认），0 关闭推送
   JDEXPRESS_ACCOUNT_LIMIT  可选，仅运行前 N 个账号（用于测试）
   JDEXPRESS_REF_FILTER  可选，仅运行指定账号标识（用于测试）
@@ -78,10 +79,17 @@ def parse_accounts() -> List[Tuple[str, str]]:
 
 
 def get_wx_code(server: str, ref: str, app_id: str = APP_ID) -> str:
+    headers = {
+            "Content-Type": "application/json"
+        }
+    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+    if api_key:
+        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
     response = requests.post(
         f"{server}/wxapp/getCode",
         json={"ref": ref, "app_id": app_id},
         timeout=TIMEOUT,
+        headers=headers
     )
     response.raise_for_status()
     payload = response.json()

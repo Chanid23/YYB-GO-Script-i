@@ -7,6 +7,7 @@ cron: 18 8 * * *
 青龙环境变量：
   YYB_SERVER  必填，YYB-Go-Enhanced地址@微信账号标识，多账号每行一条
               例：yyb-go:8000@1
+  YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
   HRT_TOKEN   可选，仅用于首次迁移旧登录态；多账号每行一条并与 YYB_SERVER 对应
 
 依赖：requests、pycryptodome（仓库 requirements.txt 已声明）
@@ -173,10 +174,16 @@ class HRT:
         self.token = ""
 
     def yyb(self, endpoint: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        headers = {
+            "Content-Type": "application/json"
+        }
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+        if api_key:
+            headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
         body: Dict[str, Any] = {"ref": self.account.ref, "app_id": APP_ID}
         if extra:
             body.update(extra)
-        response = self.session.post(self.account.server + endpoint, json=body, timeout=TIMEOUT)
+        response = self.session.post(self.account.server + endpoint, json=body, timeout=TIMEOUT,headers=headers)
         response.raise_for_status()
         outer = response.json()
         if int(outer.get("code", -1)) != 0:

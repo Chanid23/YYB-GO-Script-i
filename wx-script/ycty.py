@@ -12,6 +12,7 @@ cron: 44 7 * * *
 青龙环境变量：
   YYB_SERVER           必填，YYB-Go-Enhanced地址@微信账号标识，多账号每行一条
                        例：yyb-go:8000@1
+  YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
 
 依赖：requests
 通知：优先使用青龙内置 notify.py；未配置时回落到 PushPlus / Server酱 / 企业微信 / Bark。

@@ -12,6 +12,7 @@ QQ音乐签到 v1.2.0（YYB-Go-Enhanced 直连版）
    YYB_SERVER                                       必填，每行一个 地址@账号ref
    - 青龙与 YYB-Go 同属 qinglong_default 网络时使用：yyb-go:8000@账号ref
    - 多账号一行一个；脚本会逐行选择对应服务地址取 code
+   YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
 
 2. 账号变量：
    WX_ID                                            可选，账号白名单
@@ -392,6 +393,12 @@ def dispatch_notify(title: str, content: str) -> None:
 def get_code(wxid: str) -> str | None:
     """直接调用 YYB-Go-Enhanced /wxapp/getCode 获取一次性微信 code。"""
     server = ACCOUNT_SERVERS.get(wxid, "")
+    headers = {
+            "Content-Type": "application/json"
+        }
+    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+    if api_key:
+        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
     if not server:
         print(f"❌ [授权] 未找到账号 {mask(wxid)} 对应的 YYB 服务")
         return None
@@ -402,6 +409,7 @@ def get_code(wxid: str) -> str | None:
                 f"{server}/wxapp/getCode",
                 json={"ref": wxid, "app_id": APPID},
                 timeout=30,
+                headers=headers
             )
             response.raise_for_status()
             body = response.json()
