@@ -23,7 +23,7 @@ cron: 15 6,20 * * *
   elm_cookie_file       可选，额外导出 Cookie 文件路径（含凭据，勿提交仓库）
 
 依赖：Python 3.9+ 仅标准库；登录参数桥需 Node 与 elm_cookie_assets/awsc_bridge.cjs
-     （未随仓库提供，请自行获取；缺失时自动降级为基础登录请求）。
+     （资源已随仓库提供；青龙订阅需配置依赖文件和 cjs/json 后缀，见 docs/elm_cookie.md）。
 通知：无，结果以日志输出为主（✅ 成功 / ⚠️ 需人工 / ❌ 失败，退出码仅真失败非 0）。
 功能：YYB 取码 → 小程序登录 → 身份 Cookie 校验 → 写入青龙变量（写入读回校验）。
 

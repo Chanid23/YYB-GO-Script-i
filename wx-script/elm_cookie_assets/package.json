@@ -1,0 +1,6 @@
+{
+  "name": "eleme-awsc-assets",
+  "private": true,
+  "type": "commonjs",
+  "description": "饿了么 code 登录算法参数(bx-ua/mini-janus/bx-umidtoken)生成资源。父项目 package.json 为 type:module，此处覆盖为 commonjs，使 mor.v.js / @babel /*.js 以 CommonJS 加载。"
+}

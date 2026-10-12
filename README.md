@@ -10,7 +10,7 @@
 ### 1. 只拉取微信小程序脚本
 
 ```bash
-ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^wx-script/.*\.(js|py)$" "" "" "main" "js py"
+ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^wx-script/[^/]+\.(js|py)$" "" "^wx-script/elm_cookie_assets/.*\.(js|cjs|json)$" "main" "js py cjs json"
 ```
 
 ### 2. 只拉取独立脚本
@@ -22,7 +22,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^idp-script/.*\.(js|py
 ### 3. 拉取全部脚本
 
 ```bash
-ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script)/.*\.(js|py)$" "" "" "main" "js py"
+ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script)/[^/]+\.(js|py)$" "" "^wx-script/elm_cookie_assets/.*\.(js|cjs|json)$" "main" "js py cjs json"
 ```
 
 参数顺序：
@@ -32,6 +32,8 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 ```
 
 不同青龙版本的 `ql repo` 参数可能存在差异。如果命令行筛选无效，请在青龙面板的“订阅管理”中填写相同的仓库地址、分支和白名单。
+
+淘宝闪购 Cookie 的 AWSC 资源位于 `wx-script/elm_cookie_assets/`，必须作为**依赖文件**同步，不能作为定时任务运行。已存在的订阅也需补上上述依赖正则，并将文件后缀更新为 `js py cjs json`；仅拉取 `js py` 会缺少 `.cjs` 参数桥和 `package.json`。白名单只匹配脚本目录第一层，避免给资源 JS 创建定时任务。详见 [淘宝闪购 Cookie 使用说明](docs/elm_cookie.md)。
 
 ## 微信小程序脚本
 
@@ -71,7 +73,6 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 哈啰出行 | `hlcx.py` |
 | WorkBuddy签到 | `WorkBuddy_yyb.py` |
 | elm_Cookie同步 | `elm_cookie.py` |
-
 | 勇闯天涯签到 | `ycty.py` |
 | 众安健康签到 | `zajk.py` |
 使用前请先部署 YYB-Go-Enhanced，并按各脚本文件头部说明配置 `YYB_SERVER` 等环境变量。
