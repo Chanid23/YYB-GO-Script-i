@@ -6,7 +6,7 @@
  *
  * 环境变量：
  * - YYB_SERVER   必填；YYB-Go-Enhanced地址@账号标识，多账号每行一条
- * - YYB_API_KEY             启用 YYB_PROTOCOL_TOKEN 后配置
+ * - YYB_API_KEY / YYB_PROTOCOL_TOKEN             启用协议鉴权时配置，二选一
  * - JGPY_NOTIFY  可选；默认1，设为0关闭青龙通知
  *
  * 业务接口：smp-api.iyouke.com/dtapi
@@ -74,14 +74,15 @@ async function requestJson(url, options = {}, timeoutMs = 20000) {
   }
 }
 
-async function getWxCode(account) {
-  const headers = {
-    "Content-Type": "application/json",
-  };
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
 
-  if (process.env.YYB_API_KEY) {
-    headers.Authorization = `Bearer ${process.env.YYB_API_KEY}`;
-  }
+async function getWxCode(account) {
+  const headers = _yybAuthHeaders();
   const response = await requestJson(`${account.server}/wxapp/getCode`, {
     method: 'POST',
     headers: headers,

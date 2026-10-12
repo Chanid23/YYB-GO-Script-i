@@ -5,11 +5,11 @@ name: 长虹智慧家居签到
 cron: 18 8 * * *
 依赖: requests；通知使用青龙自带 notify.py。
 YYB_SERVER: 服务地址@账号ID或OpenID，多账号换行；可直接复用现有变量。
-YYB_API_KEY: 启用 YYB_PROTOCOL_TOKEN 后配置
+YYB_API_KEY / YYB_PROTOCOL_TOKEN: 启用协议鉴权时配置，二选一
 CH_AGGR_ID: 可选，手动指定签到活动ID；默认从首页“签到”菜单发现。
 CH_NOTIFY: 默认1，设0关闭通知。
 CH_IPV4_ONLY: 默认1；规避部分容器AAAA解析失败，设0恢复双栈解析。
-作者: lcmovie https://github.com/lcmovie
+作者：lcmovie https://github.com/lcmovie
 """
 
 import base64

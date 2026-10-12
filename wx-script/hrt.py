@@ -7,7 +7,7 @@ cron: 18 8 * * *
 青龙环境变量：
   YYB_SERVER  必填，YYB-Go-Enhanced地址@微信账号标识，多账号每行一条
               例：yyb-go:8000@1
-  YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
   HRT_TOKEN   可选，仅用于首次迁移旧登录态；多账号每行一条并与 YYB_SERVER 对应
 
 依赖：requests、pycryptodome（仓库 requirements.txt 已声明）

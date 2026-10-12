@@ -3,7 +3,7 @@ name: 飞猪签到
 入口: 飞猪微信小程序
 功能: 飞猪里程每日签到
 变量: YYB_SERVER (YYB-Go-Enhanced 地址@微信账号标识，多账号换行分隔)
-变量: YYB_API_KEY: 启用 YYB_PROTOCOL_TOKEN 后配置
+变量: YYB_API_KEY / YYB_PROTOCOL_TOKEN: 启用协议鉴权时配置，二选一
 定时: 每天一次
 cron: 16 8 * * *
 依赖: requests
@@ -73,7 +73,7 @@ class FliggyTask:
         headers = {
             "Content-Type": "application/json"
         }
-        api_key = os.getenv("YYB_API_KEY")
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         try:

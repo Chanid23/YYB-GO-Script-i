@@ -29,15 +29,16 @@ function _yybRouteFor(identifier) {
     throw new Error(`YYB_SERVER 中找不到账号标识：${wanted || '(空)'}`);
 }
 
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
+
 async function getSingleCode(appId, identifier) {
     const route = _yybRouteFor(identifier);
-    const headers = {
-        "Content-Type": "application/json",
-      };
-    
-      if (process.env.YYB_API_KEY) {
-        headers.Authorization = `Bearer ${process.env.YYB_API_KEY}`;
-      }
+    const headers = _yybAuthHeaders();
     const response = await axios.post(`${route.server}/wxapp/getCode`,
         { ref: route.ref, app_id: appId },
         { timeout: 30000, headers: headers });
@@ -54,7 +55,7 @@ async function _yybResult(path, appId, identifier) {
     const route = _yybRouteFor(identifier);
     const response = await axios.post(`${route.server}${path}`,
         { ref: route.ref, app_id: appId },
-        { timeout: 30000, headers: { 'Content-Type': 'application/json' } });
+        { timeout: 30000, headers: _yybAuthHeaders() });
     const body = response.data;
     if (!body || Number(body.code) !== 0) {
         throw new Error(`${path} 返回失败：${body?.msg || body?.message || JSON.stringify(body)}`);
@@ -112,7 +113,7 @@ const qlNotify = { sendNotify: _sendQingLongNotify, send: _sendQingLongNotify };
 变量：
   YYB_SERVER     YYB-Go-Enhanced 路由，每行：地址@账号标识
   账号直接来自 YYB_SERVER；无需配置 WX_ID
-  YYB_API_KEY    启用 YYB_PROTOCOL_TOKEN 后配置
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN    启用协议鉴权时配置，二选一
 ------------------------------------------
 契约（appid wxe417414e03e537aa，host lm.api.sujh.net，appid头 shilv）：
 （以下路径与参数均来自 Reqable 实抓，2026-09-09 验证通过：签到前 signIn=0/score=30，

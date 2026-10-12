@@ -7,7 +7,7 @@
 JLC 小程序签到脚本（青龙面板版 / 多账号 / 推送 / 查询豆豆总数）
 【环境变量】
 - YYB_SERVER: YYB-Go-Enhanced 账号配置，格式：server:port@ref，多账号换行
-- YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
+- YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
 - JLC: 可选，仅运行指定 ref，格式：ref#备注，多账号用换行或 & 分隔
 - JLC_AUTH: 可选手动凭据，格式：token#secret，多账号用换行或 & 分隔
 【依赖】

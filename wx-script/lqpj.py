@@ -24,7 +24,7 @@ cron: 30 9 * * *
 # 环境变量：
 #   YYB_SERVER      YYB-Go-Enhanced 路由，每行：地址@账号标识
 #   账号直接来自 YYB_SERVER；无需配置 WX_ID / lqpj
-#   YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
+#   YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
 
 import json
 import os

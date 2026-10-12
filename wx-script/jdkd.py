@@ -7,10 +7,10 @@ cron: 17 8 * * *
 青龙环境变量：
   YYB_SERVER  YYB-Go-Enhanced 地址@账号标识，多账号每行一条
               例：yyb-go:8000@1
-  YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
   JDEXPRESS_NOTIFY  1 推送（默认），0 关闭推送
   JDEXPRESS_ACCOUNT_LIMIT  可选，仅运行前 N 个账号（用于测试）
   JDEXPRESS_REF_FILTER  可选，仅运行指定账号标识（用于测试）
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN  YYB-Go-Enhanced 开启协议鉴权时填写，二选一
 
 作者：lcmovie https://github.com/lcmovie
 
@@ -21,6 +21,7 @@ cron: 17 8 * * *
   2026-09-04 v1.0  依据手机微信真实 HAR 实现登录、签到、奖励核算和通知
   2026-09-04 v1.1  登录改用 YYB-Go + 京东 PT OAuth 跳转链，修复无 pt_key/pt_pin
   2026-09-04 v1.2  增加全参数登录回退，区分未绑定京东账号与风控账号
+  2026-10-11 v1.3  修复服务端开启协议鉴权后取码 401：协议请求补充 Authorization 头
 """
 
 import html
@@ -35,6 +36,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
+
+
+def _yyb_auth_headers():
+    """YYB-Go-Enhanced 协议接口鉴权头；未配置令牌时返回空字典，兼容未开启鉴权的服务端。"""
+    _token = (os.getenv("YYB_API_KEY") or os.getenv("YYB_PROTOCOL_TOKEN") or "").strip()
+    return {"Authorization": "Bearer " + _token} if _token else {}
 
 
 APP_NAME = "京东快递签到"
@@ -79,17 +86,11 @@ def parse_accounts() -> List[Tuple[str, str]]:
 
 
 def get_wx_code(server: str, ref: str, app_id: str = APP_ID) -> str:
-    headers = {
-            "Content-Type": "application/json"
-        }
-    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
-    if api_key:
-        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
     response = requests.post(
         f"{server}/wxapp/getCode",
+        headers=_yyb_auth_headers(),
         json={"ref": ref, "app_id": app_id},
         timeout=TIMEOUT,
-        headers=headers
     )
     response.raise_for_status()
     payload = response.json()
@@ -176,6 +177,7 @@ def follow_acrj(session: requests.Session, payload: Dict[str, Any]) -> str:
 def get_yyb_user_info(server: str, ref: str) -> Dict[str, str]:
     response = requests.post(
         f"{server}/wxapp/operateWxData",
+        headers=_yyb_auth_headers(),
         json={
             "ref": ref,
             "app_id": JD_LOGIN_APP_ID,

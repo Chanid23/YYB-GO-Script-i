@@ -13,7 +13,7 @@
   YYB_SERVER      YYB-Go-Enhanced 地址@账号ref，多账号一行一个
 
 选填：
-  YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
   WX_ID/WXIDXJ    只运行指定账号，格式：ref#备注，多账号换行或 & 分隔
                   未配置时自动读取 YYB_SERVER 中的全部账号ref
   WECHAT_SERVER   旧微信协议服务回退地址

@@ -6,7 +6,7 @@
 作者：lcmovie https://github.com/lcmovie
 环境变量：
   YYB_SERVER：每行一个 server@微信账号标识，例如 yyb-go:8000@1
-  YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
   MI_COMMUNITY_APPID：可选，默认使用小米社区小程序 AppID
   MI_COMMUNITY_NOTIFY：可选，默认 1；设为 0 可关闭青龙通知
   MI_COMMUNITY_REF：可选，仅运行指定微信账号标识，便于单账号测试
@@ -203,6 +203,7 @@ def get_code(server, ref):
         f"{host}/wxapp/getCode",
         json={"ref": ref, "app_id": APPID},
         timeout=20,
+        headers=headers,
     )
     response.raise_for_status()
     body = response.json()

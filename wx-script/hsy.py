@@ -5,7 +5,7 @@
 #
 # 环境变量：
 #   YYB_SERVER   每行：地址@账号标识（例如 http://yyb-go:8000@1）
-#   YYB_API_KEY       启用 YYB_PROTOCOL_TOKEN 后配置
+#   YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
 #   HSY_NOTIFY   0 关闭青龙通知；默认 1
 #
 # 作者 lcmovie  https://github.com/lcmovie/YYB-GO-Script-i

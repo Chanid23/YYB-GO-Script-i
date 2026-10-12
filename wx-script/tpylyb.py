@@ -6,7 +6,7 @@
 name: 太平洋蓝医保
 Date: 2026-09-02
 YYB_SERVER：YYB-Go-Enhanced 路由，每行：地址@账号标识
-YYB_API_KEY:       启用 YYB_PROTOCOL_TOKEN 后配置
+YYB_API_KEY / YYB_PROTOCOL_TOKEN:       启用协议鉴权时配置，二选一
 账号自动从 yyb_go 拉取全部存活账号；WX_ID（或 lpzl_tpylyb）仅作为可选白名单过滤，留空即用全部
 cron: 28 6,19 * * *
 version: 2.3
