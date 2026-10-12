@@ -70,6 +70,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 南方航空签到 | `nfhk.py` |
 | 哈啰出行 | `hlcx.py` |
 | WorkBuddy签到 | `WorkBuddy_yyb.py` |
+| 淘宝闪购Cookie同步 | `elm_cookie.py` |
 
 | 勇闯天涯签到 | `ycty.py` |
 | 众安健康签到 | `zajk.py` |
