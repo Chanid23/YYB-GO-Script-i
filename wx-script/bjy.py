@@ -27,6 +27,7 @@
 
 环境变量：
   YYB_SERVER        YYB-Go-Enhanced 路由，每行：地址@账号标识
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
   账号直接来自 YYB_SERVER；无需配置 WX_ID
   PLUSPLUS_TOKEN    PushPlus token，可选
   PROXY_API         品赞代理提取 API，可选
@@ -103,8 +104,15 @@ def _yyb_route(identifier):
 def _yyb_call(endpoint, app_id, identifier):
     import requests as _requests
     route = _yyb_route(identifier)
+    headers = {
+        "Content-Type": "application/json"
+    }
+    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+    if api_key:
+        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
+
     response = _requests.post(route["server"] + endpoint,
-                              json={"ref": route["ref"], "app_id": app_id}, timeout=30)
+                              json={"ref": route["ref"], "app_id": app_id}, timeout=30, headers=headers)
     response.raise_for_status()
     body = response.json()
     if not isinstance(body, dict) or int(body.get("code", -1)) != 0:

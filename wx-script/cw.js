@@ -11,6 +11,7 @@
  *
  * 环境变量：
  * - YYB_SERVER              必填；YYB-Go-Enhanced地址@账号标识，多账号每行一条
+ * - YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
 * - CHUANGW_APPID           默认 wxff438d3c60c63fb6
  * - CHUANGW_APP_PATH        默认 /pages/login/login
  * - CHUANGW_RUN_TASKS       默认1，0=只登录拿token
@@ -316,10 +317,17 @@ async function httpText(url, { method = 'GET', headers = {}, body, timeout = 200
   }
 }
 
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
+
 async function getWxCode(server, ref, appid = APPID) {
   const ret = await httpJson(`${server}/wxapp/getCode`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: _yybAuthHeaders(),
     body: { ref, app_id: appid },
   });
   const code = ret?.data?.result?.code || '';

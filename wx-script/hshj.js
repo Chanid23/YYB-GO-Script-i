@@ -4,6 +4,7 @@
 
 //  环境变量：
 //    YYB_SERVER         必填，格式：地址@账号ref，多账号换行
+//    YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
 //    WX_ID              可选，仅运行指定ref，格式：ref#备注，多账号换行或 & 分隔
 //    WECHAT_SERVER      可选，旧微信协议服务回退地址
 //    HSJJ_AUTO_CLAIM_H5 设为 '0' 或 'false' 关闭自动提现（默认开启）
@@ -54,6 +55,13 @@ function selectYybEntry(identifier) {
     throw new Error(`YYB_SERVER 中找不到账号ref：${raw}`);
 }
 
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
+
 async function yybPost(identifier, appId, route, payload) {
     const item = selectYybEntry(identifier);
     const body = { ref: item.ref, app_id: appId };
@@ -62,7 +70,7 @@ async function yybPost(identifier, appId, route, payload) {
         timeout: 30000,
         proxy: false,
         validateStatus: () => true,
-        headers: { 'Content-Type': 'application/json' },
+        headers: _yybAuthHeaders(),
     });
     const data = response.data || {};
     if (response.status < 200 || response.status >= 300) {
@@ -413,7 +421,7 @@ async function getPhoneCodeInfo(wxid) {
 
         if (debug) log(`[YYB] 请求手机号code: ref=${resolvedRef}, app_id=${APPID}`);
         const resp = await axios.post(url, { ref: resolvedRef, app_id: APPID }, {
-            headers: { 'Content-Type': 'application/json' },
+            headers: _yybAuthHeaders(),
             timeout: 30000,
             validateStatus: () => true
         });
@@ -671,7 +679,7 @@ async function getEncryptKey(wxid) {
             app_id: APPID,
             payload: { api_name: 'webapi_getuserencryptkey' }
         }, {
-            headers: { 'Content-Type': 'application/json' },
+            headers: _yybAuthHeaders(),
             timeout: 30000,
             validateStatus: () => true
         });

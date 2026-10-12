@@ -7,6 +7,7 @@
 JLC 小程序签到脚本（青龙面板版 / 多账号 / 推送 / 查询豆豆总数）
 【环境变量】
 - YYB_SERVER: YYB-Go-Enhanced 账号配置，格式：server:port@ref，多账号换行
+- YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
 - JLC: 可选，仅运行指定 ref，格式：ref#备注，多账号用换行或 & 分隔
 - JLC_AUTH: 可选手动凭据，格式：token#secret，多账号用换行或 & 分隔
 【依赖】
@@ -151,10 +152,17 @@ def get_wx_code(account_id):
         server, ref = _select_yyb_account(account_id)
         yyb_session = requests.Session()
         yyb_session.trust_env = False
+        headers = {
+            "Content-Type": "application/json"
+        }
+        api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+        if api_key:
+            headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
         response = yyb_session.post(
             f"{server}/wxapp/getCode",
             json={"ref": ref, "app_id": JLC_MINI_APPID},
             timeout=30,
+            headers=headers
         )
         try:
             data = response.json()

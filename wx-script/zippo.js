@@ -29,11 +29,19 @@ function _yybRouteFor(identifier) {
     throw new Error(`YYB_SERVER 中找不到账号标识：${wanted || '(空)'}`);
 }
 
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
+
 async function getSingleCode(appId, identifier) {
     const route = _yybRouteFor(identifier);
+    const headers = _yybAuthHeaders();
     const response = await axios.post(`${route.server}/wxapp/getCode`,
         { ref: route.ref, app_id: appId },
-        { timeout: 30000, headers: { 'Content-Type': 'application/json' } });
+        { timeout: 30000, headers: headers });
     const body = response.data;
     if (!body || Number(body.code) !== 0) {
         throw new Error(`/wxapp/getCode 返回失败：${body?.msg || body?.message || JSON.stringify(body)}`);
@@ -83,6 +91,7 @@ const qlNotify = { sendNotify: _sendQingLongNotify, send: _sendQingLongNotify };
 变量：
   YYB_SERVER     YYB-Go-Enhanced 路由，每行：地址@账号标识
   账号直接来自 YYB_SERVER；无需配置 WX_ID
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN    启用协议鉴权时配置，二选一
 ------------------------------------------
 契约（appid wxaa75ffd8c2d75da7，host wx-center.zippo.com.cn）：
   这家没有业务成功码：成功就是 HTTP 2xx（登录/签到都回 **201**）且响应体里没有 code；

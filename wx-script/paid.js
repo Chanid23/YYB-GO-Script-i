@@ -55,6 +55,7 @@
  *   环境变量：
  *     YYB_SERVER   必填，格式为 地址@账号ref，多账号一行一个；可在 ref 后用 # 添加备注
  *                  ql2 内建议使用 http://yyb-go:8000@ref
+ *     YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置，二选一
  *     PAID_NOTIFY  可选，默认 1；设为 0 时关闭青龙 notify.py 汇总通知
  *     PAID_ACCOUNT_DELAY 可选，账号间固定等待秒数；默认随机 10-18 秒，测试可设为 0
  *   登录链路优先级（命中即跳过后续）：
@@ -317,10 +318,18 @@ function tokensMap(){
 }
 
 // 单账号单次取码：直接调用 YYB-Go-Enhanced /wxapp/getCode。
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
+
 async function yybGetCode(account){
+  const headers = _yybAuthHeaders();
   const resp = await fetch(`${account.server}/wxapp/getCode`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: headers,
     body: JSON.stringify({ ref: account.ref, app_id: APPID }),
   });
   const j = await resp.json().catch(() => ({}));

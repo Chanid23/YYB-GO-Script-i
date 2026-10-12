@@ -4,6 +4,7 @@
  * 海信爱家任务中心 - 青龙自动化脚本
  * 变量名：
  *   YYB_SERVER
+ *   YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
  *
  * 变量格式：
  *   YYB_SERVER=YYB-Go地址@微信账号标识
@@ -1367,9 +1368,16 @@ function parseYYBServer(raw) {
     .filter(Boolean);
 }
 
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
+
 async function yybRequest(entry, endpoint) {
   const { data } = await request('POST', `${entry.server}${endpoint}`, {
-    headers: { 'content-type': 'application/json' },
+    headers: _yybAuthHeaders(),
     data: { ref: entry.ref, app_id: CONSTS.WX_APP_ID },
     timeout: 25000,
   });

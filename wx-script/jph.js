@@ -3,6 +3,7 @@
 
 变量：
   YYB_SERVER    YYB-Go-Enhanced 地址@账号标识，多账号一行一个，必须配置
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
                 示例：yyb-go:8000@openid
   cron: 57 10,13 * * *
 
@@ -155,6 +156,13 @@ function parseYybGoEntry(rawValue) {
     .finally(() => $.done())
 
 // 获取code
+function _yybAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = String(process.env.YYB_API_KEY || '').trim() || String(process.env.YYB_PROTOCOL_TOKEN || '').trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+}
+
 async function get_code(hd) {
     xj_code = '';
     const { server, ref } = parseYybGoEntry(hd);
@@ -169,7 +177,8 @@ async function get_code(hd) {
         }, {
             timeout: 20000,
             proxy: false,
-            validateStatus: () => true
+            validateStatus: () => true,
+            headers: _yybAuthHeaders()
         });
         const result = response.data;
         xj_code = result && result.data && result.data.result && result.data.result.code;

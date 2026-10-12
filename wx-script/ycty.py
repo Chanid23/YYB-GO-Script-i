@@ -12,6 +12,7 @@ cron: 44 7 * * *
 青龙环境变量：
   YYB_SERVER           必填，YYB-Go-Enhanced地址@微信账号标识，多账号每行一条
                        例：yyb-go:8000@1
+  YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
 
 依赖：requests
 通知：优先使用青龙内置 notify.py；未配置时回落到 PushPlus / Server酱 / 企业微信 / Bark。
@@ -236,9 +237,9 @@ def yyb_get_code(host: str, ref: str) -> Tuple[str, str]:
     """YYB 取 wx.login code → (code, openid)。"""
     url = host.rstrip("/") + "/wxapp/getCode"
     headers = {"User-Agent": _CURRENT_UA, "Content-Type": "application/json"}
-    api_key = (os.getenv("YYB_API_KEY", "") or "").strip()
+    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
     if api_key:
-        headers["Authorization"] = api_key
+        headers["Authorization"] = api_key if " " in api_key else "Bearer " + api_key
     r = requests.post(url, json={"app_id": APP_NO, "ref": str(ref)}, headers=headers, timeout=TIMEOUT)
     dbg("YYB getCode", r.status_code, preview(r.text, 300))
     if r.status_code != 200:
