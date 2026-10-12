@@ -5,5 +5,3 @@ wxzftxbbs_account_info.json
 **/env_check.json
 json/
 node_modules/
-**/.protocol_device.json
-**/algorithm_params_result.json
