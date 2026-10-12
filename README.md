@@ -75,7 +75,6 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | elm_Cookie同步 | `elm_cookie.py` |
 | 勇闯天涯签到 | `ycty.py` |
 | 众安健康签到 | `zajk.py` |
-使用前请先部署 YYB-Go-Enhanced，并按各脚本文件头部说明配置 `YYB_SERVER` 等环境变量。
 
 ## 独立脚本
 
