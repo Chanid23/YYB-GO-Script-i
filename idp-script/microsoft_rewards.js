@@ -66,6 +66,9 @@ function loadDependencies() {
     }
     try {
         axiosRetry = require('axios-retry')
+        // axios-retry v4 采用 ESM/CJS 双包导出，require 得到的是模块对象，
+        // 真正的函数挂在 .default 上，直接用会报 "axiosRetry is not a function"
+        if (axiosRetry && axiosRetry.default) axiosRetry = axiosRetry.default
     } catch {
         // axios-retry 可选，缺失时使用内置重试
         axiosRetry = null
@@ -1005,13 +1008,24 @@ class BrowserManager {
         context.setDefaultTimeout(this.config.globalTimeout)
 
         // 禁用 WebAuthn
+        // 注意：只替换 navigator.credentials 并不够。微软登录页是通过
+        // window.PublicKeyCredential 是否存在来判断浏览器是否支持 FIDO 的；
+        // 该对象仍然存在时，注册过 passkey 的账号会被强制跳转到
+        // login.microsoft.com/<tenant>/bridge/fido 桥页，而 _detectState
+        // 没有该页面对应的选择器（缺 fidoImage），会一直返回 UNKNOWN，
+        // 最终抛出「登录超时：超过最大迭代次数」。
         await context.addInitScript(() => {
             try {
+                Object.defineProperty(window, 'PublicKeyCredential', {
+                    get: () => undefined,
+                    configurable: true
+                })
                 Object.defineProperty(navigator, 'credentials', {
                     value: {
                         create: () => Promise.reject(new Error('WebAuthn disabled')),
                         get: () => Promise.reject(new Error('WebAuthn disabled'))
-                    }
+                    },
+                    configurable: true
                 })
             } catch {
                 // 忽略
