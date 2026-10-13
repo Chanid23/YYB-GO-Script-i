@@ -3,7 +3,7 @@
 # name: 移动云盘
 # cron: 0 0 8,16,20 * * *
 """
-移动云盘自动签到 v5.0.7
+移动云盘自动签到_code版v5.1.0
 
 包含以下功能:
 1. 每日自动签到 (签到/抽奖/摇一摇/新版云朵领取)
@@ -11,27 +11,29 @@
 3. 云朵中心新版任务自动处理 (上传/分享/AI相机/月任务补传等)
 4. 临时文件智能清理与详细日志推送
 
-更新说明:
-
-### 20260917
-v5.0.7:
-- 修复历史缓存覆盖最新 Authorization 导致的鉴权失败。
-- 适配 querySpecTokenV2 鉴权接口，并保留旧接口回退。
-- 接入青龙 notify.py 通知模块。
-- 删除已过期的公众号签到、摇一摇和抽奖任务。
-
-### 20260605
-v5.0.6:
-- 修复缓存token。
-- 修复部分热门任务和云盘每月任务。
-
 配置说明:
+
+当未配置 ydyp 变量时，自动从yyb获取ydyp Cookie，
+如手动抓包配置 ydyp 变量时，放弃从yyb获取，只使用手动抓包变量
+
 变量名: ydyp
 赋值方式:
 格式：Authorization值#手机号
 抓包获取 Authorization方法：
 1.登录https://yun.139.com，cookie中找到Authorization字段，复制其值。
 2.登陆网址抓取https://sm.linzixuan.top/
+
+YYB 登录（无需配置 ydyp Cookie）：
+YDYP_LOGIN_MODE=yyb
+YYB_SERVER：沿用已有配置，每行一个 服务地址@账号ref。
+YDYP_YYB_SERVER：可选，仅覆盖本脚本的服务与账号列表。
+YDYP_YYB_REFS：可选，账号ref白名单，以 &、逗号或换行分隔。
+YDYP_YYB_TOKEN：可选，优先于 YYB_PROTOCOL_TOKEN / YYB_API_KEY。
+微信账号须具备目标小程序手机号授权能力；本脚本不发送短信或自动开户。
+登录手机号由 YYB 的授权结果决定；脚本不支持任选微信内的其他手机号。
+YDYP_LOGIN_MODE 默认 auto：有 ydyp 时保持 Cookie 模式；有专用
+YDYP_YYB_SERVER 或没有 ydyp 而配置了 YYB_SERVER 时使用 YYB。
+也可设置 cookie 强制保持原模式。
 
 ⚠️ 依赖安装:
 pip3 install requests pycryptodome
@@ -57,12 +59,21 @@ import requests
 
 try:
     from Crypto.Cipher import AES
-    from Crypto.Util.Padding import pad
+    from Crypto.Util.Padding import pad, unpad
 except ImportError:
     AES = None
     pad = None
+    unpad = None
 
-SCRIPT_VERSION = '5.0.7'
+SCRIPT_VERSION = '5.1.0'
+
+YDYP_WX_APPID = 'wx4e4ed37286c816c2'
+YDYP_WX_VERSION = '5.14.4'
+# 小程序 142 包 common/config/index.js / components/verifyModal/utils.js。
+# 这是客户端协议常量，不是账号凭据。
+YDYP_COOL_FLAG_KEY = b'taNk805XxEM4uDWvVTMo+BVe'
+YDYP_USER_ZONE_KEY = b'qPqDw263XgFgL3u8'
+YDYP_USER_BASE_URL = 'https://user-njs.yun.139.com/user'
 
 TOKEN_STORAGE_FILENAME = 'ydyp_token_storage.json'
 DEVICE_ID_STORAGE_FILENAME = ''
@@ -187,6 +198,196 @@ def extract_raw_token(token, account):
 
 def build_authorization(account, raw_token):
     return f"Basic {base64.b64encode(f'mobile:{account}:{raw_token}'.encode()).decode()}"
+
+
+def encrypt_cloud_login_body(data, iv=None):
+    """复现小程序 aesEncrypt：Base64(16字节IV + AES-CBC密文)。"""
+    if AES is None or pad is None:
+        raise RuntimeError('YYB 登录需要安装 pycryptodome')
+    iv = iv if iv is not None else random_string(16).encode('ascii')
+    if not isinstance(iv, bytes) or len(iv) != 16:
+        raise ValueError('云盘登录 IV 必须为16字节')
+    text = json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    cipher = AES.new(YDYP_COOL_FLAG_KEY, AES.MODE_CBC, iv)
+    return base64.b64encode(iv + cipher.encrypt(pad(text, AES.block_size))).decode('ascii')
+
+
+def decrypt_cloud_login_response(text):
+    if AES is None or unpad is None:
+        raise RuntimeError('YYB 登录需要安装 pycryptodome')
+    try:
+        # 兼容服务器直接返回 JSON 的错误响应；正常响应为 CBC 密文。
+        if text.lstrip().startswith('{'):
+            result = json.loads(text)
+        else:
+            raw = base64.b64decode(text.strip(), validate=True)
+            if len(raw) < 32 or (len(raw) - 16) % 16:
+                raise ValueError('invalid ciphertext')
+            cipher = AES.new(YDYP_COOL_FLAG_KEY, AES.MODE_CBC, raw[:16])
+            result = json.loads(unpad(cipher.decrypt(raw[16:]), AES.block_size).decode('utf-8'))
+        if not isinstance(result, dict):
+            raise ValueError('invalid response')
+        return result
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise RuntimeError('云盘登录响应解码失败') from exc
+
+
+def decode_cloud_login_data(data):
+    """当前小程序登录结果的 data 是 userZoneKey 加密的十六进制密文。"""
+    if isinstance(data, dict):
+        return data
+    try:
+        raw = bytes.fromhex(data)
+        cipher = AES.new(YDYP_USER_ZONE_KEY, AES.MODE_ECB)
+        result = json.loads(unpad(cipher.decrypt(raw), AES.block_size).decode('utf-8'))
+        if not isinstance(result, dict):
+            raise ValueError('invalid data')
+        return result
+    except (ValueError, TypeError, UnicodeError, AttributeError) as exc:
+        raise RuntimeError('云盘登录结果解密失败') from exc
+
+
+def parse_yyb_accounts(value, allowed_refs=None):
+    accounts, seen = [], set()
+    for line_no, raw in enumerate((value or '').splitlines(), 1):
+        item = raw.strip()
+        if not item:
+            continue
+        if '@' not in item:
+            raise ValueError(f'YYB 配置第 {line_no} 行缺少 @')
+        server, ref = (x.strip() for x in item.rsplit('@', 1))
+        if not server or not ref:
+            raise ValueError(f'YYB 配置第 {line_no} 行地址或账号为空')
+        if not server.startswith(('http://', 'https://')):
+            server = 'http://' + server
+        server = server.rstrip('/')
+        if allowed_refs is not None and ref not in allowed_refs:
+            continue
+        # 同一微信账号不重复取码；同一云盘手机号在登录后再次去重。
+        if ref not in seen:
+            seen.add(ref)
+            accounts.append((server, ref))
+    return accounts
+
+
+def login_with_yyb(server, ref, session=None):
+    """复现当前生产页面的 phoneCode/pintype=27，不使用遗留公众号登录。"""
+    if AES is None or unpad is None:
+        raise RuntimeError('YYB 登录需要安装 pycryptodome')
+    owned_session = session is None
+    session = session or requests.Session()
+    if owned_session:
+        session.trust_env = False
+    try:
+        protocol_token = (os.getenv('YDYP_YYB_TOKEN') or os.getenv('YYB_PROTOCOL_TOKEN') or os.getenv('YYB_API_KEY') or '').strip()
+        code_headers = {'Content-Type': 'application/json'}
+        if protocol_token:
+            code_headers['Authorization'] = 'Bearer ' + protocol_token
+        code_response = session.post(
+            server + '/wxapp/getPhoneNumber',
+            json={'ref': ref, 'app_id': YDYP_WX_APPID},
+            headers=code_headers, timeout=45,
+        )
+        if code_response.status_code != 200:
+            raise RuntimeError(f'YYB 手机号授权 HTTP {code_response.status_code}')
+        try:
+            envelope = code_response.json()
+        except ValueError as exc:
+            raise RuntimeError('YYB 返回的不是 JSON，请检查服务地址') from exc
+        data = envelope.get('data') if isinstance(envelope, dict) else None
+        result = data.get('result') if isinstance(data, dict) else None
+        code = result.get('code') if isinstance(result, dict) and str(envelope.get('code')) == '0' else None
+        if not isinstance(code, str) or not code.strip() or code.lower() in ('null', 'none'):
+            raise RuntimeError('YYB 未返回有效的手机号授权 code')
+
+        login_body = {
+            'clienttype': '634', 'version': YDYP_WX_VERSION, 'cpid': '255',
+            'msisdn': '', 'dycpwd': code, 'pintype': '27',
+            'extInfo': {'ifOpenAccount': 0},
+        }
+        headers = {
+            'Content-Type': 'application/json', 'hcy-cool-flag': '1',
+            'x-request-model': 'nk',
+            'x-huawei-channelSrc': '10214200', 'x-inner-ntwk': '2',
+            'x-NetType': 'wifi', 'mcloud-channel': '1000101',
+            'mcloud-client': '10801', 'mcloud-version': YDYP_WX_VERSION,
+            'mcloud-network': 'WIFI', 'x-yun-client-info': '||8||||||||||||',
+            'INNER-HCY-ROUTER-HTTPS': '1', 'x-yun-tid': generate_uuid(),
+            'Referer': f'https://servicewechat.com/{YDYP_WX_APPID}/142/page-frame.html',
+            'User-Agent': 'Mozilla/5.0 MicroMessenger/8.0.47 miniProgram/' + YDYP_WX_APPID,
+            'x-DeviceInfo': build_x_device_info(generate_device_id(), version=YDYP_WX_VERSION),
+        }
+        # 不发送RSA旧链路的encryptMsg，也不重放已消费的微信code。
+        response = session.post(
+            YDYP_USER_BASE_URL + '/thirdlogin',
+            data=encrypt_cloud_login_body(login_body), headers=headers, timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f'云盘登录 HTTP {response.status_code}')
+        body = decrypt_cloud_login_response(response.text)
+        status = str(body.get('code', ''))
+        if status not in ('0000', '0') or body.get('success') is False:
+            # 不输出业务message，它可能包含账号、票据或其他私人字段。
+            safe_status = status if re.fullmatch(r'[A-Za-z0-9_-]{1,24}', status) else 'unknown'
+            raise RuntimeError(f'云盘手机号授权登录失败 code={safe_status}')
+        info = decode_cloud_login_data(body.get('data'))
+        account = info.get('account')
+        if not account and info.get('encryptAccount'):
+            account = base64.b64decode(info['encryptAccount']).decode('utf-8')
+        account = str(account or '').strip()
+        raw_token = info.get('authToken')
+        if not re.fullmatch(r'\d{11}', account) or not isinstance(raw_token, str) or not raw_token:
+            raise RuntimeError('云盘登录结果缺少已绑定手机号或 authToken')
+        return {
+            'cookie': build_authorization(account, raw_token) + '#' + account,
+            'account': account, 'source': 'yyb',
+            'user_domain_id': info.get('userDomainId') or '',
+            'expires_at': parse_expire_time_to_millis(info.get('atExpiretime') or info.get('expiretime')),
+        }
+    except requests.RequestException as exc:
+        raise RuntimeError(f'登录网络请求失败（{type(exc).__name__}）') from exc
+    finally:
+        if owned_session:
+            session.close()
+
+
+def load_login_records():
+    cookie_config = os.getenv('ydyp', '').strip()
+    dedicated_server = os.getenv('YDYP_YYB_SERVER', '').strip()
+    yyb_config = dedicated_server or os.getenv('YYB_SERVER', '').strip()
+    mode = os.getenv('YDYP_LOGIN_MODE', 'auto').strip().lower()
+    if mode not in ('auto', 'cookie', 'yyb'):
+        raise ValueError('YDYP_LOGIN_MODE 只支持 auto、cookie、yyb')
+    if mode == 'auto':
+        mode = 'yyb' if dedicated_server or (not cookie_config and yyb_config) else 'cookie'
+    print(f'凭证获取模式: {mode}')
+    if mode == 'cookie':
+        records = [{'cookie': v.strip(), 'source': 'cookie'} for v in re.split(r'[&\n]', cookie_config) if v.strip()]
+        if not records:
+            raise ValueError('未配置 ydyp；使用 YYB 时请配置 YYB_SERVER 并设置 YDYP_LOGIN_MODE=yyb')
+        return records
+    if not yyb_config:
+        raise ValueError('YYB 模式缺少 YDYP_YYB_SERVER 或 YYB_SERVER')
+    raw_refs = os.getenv('YDYP_YYB_REFS', '').strip()
+    allowed_refs = {x.strip() for x in re.split(r'[&,，\n]', raw_refs) if x.strip()} if raw_refs else None
+    accounts = parse_yyb_accounts(yyb_config, allowed_refs)
+    if not accounts:
+        raise ValueError('YYB 配置中没有匹配本脚本的账号')
+    records, seen_accounts = [], set()
+    for index, (server, ref) in enumerate(accounts, 1):
+        try:
+            record = login_with_yyb(server, ref)
+            if record['account'] in seen_accounts:
+                print(f'YYB账号{index}: 云盘账号重复，跳过')
+                continue
+            seen_accounts.add(record['account'])
+            records.append(record)
+            print(f'YYB账号{index}: 云盘登录成功，已获得新凭证')
+        except (RuntimeError, ValueError, TypeError) as exc:
+            print(f'YYB账号{index}: {exc}')
+    if not records:
+        raise RuntimeError('全部 YYB 账号登录失败；未使用旧 Cookie 回退')
+    return records
 
 
 def parse_expire_time_to_millis(expire_time):
@@ -1984,26 +2185,32 @@ class YP:
 
 
 if __name__ == "__main__":
-    env_name = 'ydyp'
-    token = os.getenv(env_name)
-    if not token:
-        print(f'⛔️未获取到ck变量：请检查变量 {env_name} 是否填写')
-        exit(0)
-
-    cookies = [item.strip() for item in re.split(r'[&\n]', token) if item.strip()]
-    print_startup_info(len(cookies))
-    print_device_id_notice()
+    try:
+        login_records = load_login_records()
+    except (RuntimeError, ValueError) as exc:
+        print(f'⛔️ {exc}')
+        raise SystemExit(1)
+    print_startup_info(len(login_records))
+    if login_records[0].get('source') == 'cookie':
+        print_device_id_notice()
     print_storage_path_notice()
 
-    for i, account_info in enumerate(cookies, start=1):
-        yp_instance = YP(account_info)
-        account_label = yp_instance.account or f'格式错误-{i}'
+    for i, login_record in enumerate(login_records, start=1):
+        yp_instance = YP(login_record['cookie'])
+        account_label = getattr(yp_instance, 'encrypt_account', '') or f'格式错误-{i}'
         print(f"\n======== ▷ 第 {i} 个账号 【{account_label}】◁ ========")
 
         if not yp_instance.Authorization:
             print(f"⛔️ 账号 {i} 无效，跳过执行")
             continue
 
+        if login_record.get('source') == 'yyb':
+            yp_instance.user_domain_id = login_record['user_domain_id']
+            yp_instance.save_authorization_record(
+                token=yp_instance.Authorization,
+                user_domain_id=login_record['user_domain_id'],
+                expires_at=login_record['expires_at'], refreshed=True,
+            )
         yp_instance.run()
         print("\n准备进行下一个账号")
         time.sleep(random.randint(1, 3))

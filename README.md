@@ -74,6 +74,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 勇闯天涯签到 | `ycty.py` |
 | 众安健康签到 | `zajk.py` |
 | JD Cookie同步 | `jd_cookie.py` |
+| 移动云盘（code版） | `ydyp_code.py` |
 
 ## 独立脚本
 
@@ -88,7 +89,6 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 微软积分 | `Microsoft Rewards.js` |
 | 雨云自动签到 | `Rainyun.py` |
 | 无忧计划 | `wyjh.py` |
-| 移动云盘 | `ydyp.py` |
 
 各脚本所需环境变量、依赖和定时规则请查看对应文件头部说明。
 
