@@ -618,7 +618,33 @@ class SessionManager {
             )
         })
         const unique = [...new Map(filtered.map(c => [c.name, c])).values()]
-        return unique.map(c => `${c.name}=${c.value}`).join('; ')
+        // 剔除与 rewards 接口无关的登录/SSO 流程与遥测 cookie。
+        // OParams*/esctx-*/IPT/WLSSC 等只在登录跳转时使用，且会随登录次数不断累积
+        // （实测可达 20KB+），全部拼进 Cookie 头会把请求头撑过服务端上限，
+        // 导致 rewards.bing.com 直接返回 400 Bad Request - Header Field Too Long。
+        const irrelevant = /^(?:OParams\d*|esctx(?:-.*)?|IPT|buid|clrc|WLSSC|fptctx2|amsc|ak_bmsc|_HPVN|ai_session|MicrosoftApplicationsTelemetryDeviceId|MR|USRLOC|SM|ANONCHK|fpc|MSFPC|_clck|_clsk|CLID|SDIDC|JSHP)$/i
+        const relevant = unique.filter(c => !irrelevant.test(c.name))
+        const MAX_COOKIE_HEADER_LENGTH = 16000
+        let header = relevant.map(c => `${c.name}=${c.value}`).join('; ')
+        if (header.length <= MAX_COOKIE_HEADER_LENGTH) return header
+        // 兜底：裁剪后仍然超长时按重要度保留，宁可少发 cookie 也不要 400。
+        const essential = ['_U', '_C_Auth', 'tifacfaatcs', 'SRCHHPGUSR', 'MUID', '_EDGE_S', '_EDGE_CD', 'NAP', 'SUID', 'ANON', 'WLID', 'RPSSecAuth', 'MSCC', '_RwBf', '__Host-MSAAUTHP', 'SRCHD', 'SRCHUID', 'MUIDB', '_C_ETH']
+        const ordered = relevant.slice().sort((a, b) => {
+            const ia = essential.indexOf(a.name)
+            const ib = essential.indexOf(b.name)
+            return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib)
+        })
+        const kept = []
+        let size = 0
+        for (const c of ordered) {
+            const piece = `${c.name}=${c.value}`
+            const add = kept.length ? piece.length + 2 : piece.length
+            if (size + add > MAX_COOKIE_HEADER_LENGTH) continue
+            kept.push(piece)
+            size += add
+        }
+        this.logger?.warn('SESSION', `Cookie 头过长（${header.length} 字节），已裁剪为 ${kept.length}/${relevant.length} 个 cookie（${size} 字节）`)
+        return kept.join('; ')
     }
 }
 
