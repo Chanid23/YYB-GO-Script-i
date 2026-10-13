@@ -3,10 +3,19 @@
 # name: jd_cookie.py
 # cron: 0 */3 * * *
 """
-version: 2.4.2
+version: 2.4.3
 
-通过 YYB-Go-Enhanced 取微信 code 登录jd小程序，获取jd cookie
-把jd Cookie 写入青龙环境变量；默认写本地变量，配置远程青龙后自动写远程。
+合并 JDCode.py 与 JDCodeLocal.py：YYB 取码 → 京东登录 → 校验 CK → 按配置保存 → 会话预热与活动交互。
+会话预热每个账号每天仅执行一次（当天第一次运行时）；当天后续运行仅取 CK/写入，不再预热。
+按账号粒度记录当日进度，运行中断后当天重跑只补未完成的账号，不重复执行。
+预热使用独立内存会话，会话 Cookie 不回写 CK；预热入口为内部固定值，不接受环境变量修改。
+活动编号从当前落地页动态获取，不沿用历史活动号。
+日志仅输出各账号取CK与写入结果（✅ 成功 / ⚠️ 需人工 / ❌ 失败）与尾部汇总；
+不输出 CK、昵称及附加流程的任何细节。
+远程三项全部为空：写入运行脚本所在的本地青龙，不要求手动填写应用密钥。
+远程三项全部非空：只写指定远程青龙，不访问本地 DB，不导出 CK 文件。
+远程三项仅填部分：仍照常获取 CK，不认证青龙、不写入任何本地/远程变量；仍执行会话预热。
+远程认证/写入失败不回退本地；仅获取模式不是失败，取码或登录失败才计入失败数。
 
 青龙环境变量（非空环境变量优先于下方 CONFIG_*）：
   YYB_SERVER          必填，服务地址@微信账号标识，多账号每行一条，可在末尾加 #备注
@@ -32,10 +41,12 @@ version: 2.4.2
 本地：SQLite 事务写入并读回，通过 loopback 与现有本地 token/应用刷新青龙任务环境。
       不创建新应用、不改权限；刷新认证不可用时在数据库写入前报错。
 账号：按 pt_pin 匹配；保留人工备注，更新成功后启用变量；重复同账号变量报错而不误覆盖。
-通知：无，结果以日志输出为主（✅ 成功 / ⚠️ 需人工 / ❌ 失败，退出码仅真失败非 0）。
-功能：YYB 取码 → 小程序登录 → 身份 Cookie 校验 → 写入青龙变量（写入读回校验）。
+日志：每账号一行三态结果（✅/⚠️/❌）+ pt_pin 尾号 + 尾部汇总；不会输出 code、openid、密钥和完整 CK。
+通知：无。退出码：任一账号失败为 1；⚠️ 需人工不影响退出码。
+说明：远程模式仍在内存取得 CK，“本地不生成”表示不写本地变量/文件。
+      停用旧 JDCodeLocal 定时任务，只运行本文件，避免重复刷新。
 
-作者：lcmovie https://github.com/lcmovie
+原始脚本：SuperNaiBA/YYB-GO-Script；合并维护：lcmovie。
 """
 from __future__ import annotations
 
@@ -1285,6 +1296,31 @@ def _next_hop(url: str, headers: Dict[str, Any], raw: str, ua: str) -> str:
 # 使用京东 union-coupon 组件的 appid=u_hongbao、POST getCoupons、unionMyPrizeList 结构。
 # 活动号/页面号从本次落地 URL 读取，不硬编码历史活动号。
 _WARM_ROUNDS = 3  # 每个 CK 固定执行三轮，保存 CK 仅一次。
+_WARM_STATE_FILE = Path(__file__).resolve().parent / ".jd_warm.state"
+
+
+def _warm_state() -> Dict[str, Any]:
+    """读取当日附加流程进度；日期翻天后自动重置，手动改执行时间不影响判定。"""
+    today = time.strftime("%Y-%m-%d")
+    try:
+        data = json.loads(_WARM_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("date") == today:
+            done = data.get("done")
+            if isinstance(done, list):
+                return {"date": today, "done": [str(x) for x in done]}
+    except Exception:
+        pass
+    return {"date": today, "done": []}
+
+
+def _warm_save(state: Dict[str, Any]) -> None:
+    """原子写入当日进度，防止运行中断导致状态半截。"""
+    tmp = _WARM_STATE_FILE.with_name(_WARM_STATE_FILE.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_WARM_STATE_FILE)
+    except OSError:
+        pass
 
 
 def coupon_message(payload: Dict[str, Any], session: CookieOpener) -> str:
@@ -1543,6 +1579,8 @@ def main() -> int:
         print("⚠️ 远程配置未填完整，本次仅取 CK；缺少：" + "、".join(missing))
     writer = None
     ok_n = warn_n = fail_n = 0
+    warm_state = _warm_state()
+    warm_done = set(warm_state["done"])
 
     def brief_failure(exc: Exception) -> str:
         """失败原因归类为一句可读文案，对齐 elm 方案的简短失败行。"""
@@ -1591,14 +1629,18 @@ def main() -> int:
         except Exception as exc:
             warn_n += 1
             print(f"   ⚠️ 需人工：取CK通过（pt_pin 尾号 {pin_tail}）但写入失败：" + brief_failure(exc))
-        # 附加流程固定三轮静默执行；结果不进入日志与退出码。
-        for round_index in range(_WARM_ROUNDS):
-            try:
-                _run_warm_round(cookie)
-            except Exception:
-                pass
-            if round_index < _WARM_ROUNDS - 1:
-                time.sleep(1)
+        # 附加流程：每账号每天一次，进度即时落盘；中断后当天重跑只补未完成账号。
+        # 结果不进入日志与退出码。
+        if ref not in warm_done:
+            for round_index in range(_WARM_ROUNDS):
+                try:
+                    _run_warm_round(cookie)
+                except Exception:
+                    pass
+                if round_index < _WARM_ROUNDS - 1:
+                    time.sleep(1)
+            warm_done.add(ref)
+            _warm_save({"date": warm_state["date"], "done": sorted(warm_done)})
         time.sleep(1)
     print(line)
     print(f"结果汇总：✅ 成功 {ok_n} ｜ ⚠️ 需人工 {warn_n} ｜ ❌ 失败 {fail_n}（共 {total}）")
