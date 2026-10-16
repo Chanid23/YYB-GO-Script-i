@@ -90,6 +90,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 雨云自动签到 | `Rainyun.py` |
 | 无忧计划 | `wyjh.py` |
 | 电信光耀网龄 | `dxgy.py` |
+| 电信好运连连转盘 | `dxhyll.py` |
 
 各脚本所需环境变量、依赖和定时规则请查看对应文件头部说明。
 
