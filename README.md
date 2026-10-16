@@ -91,6 +91,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 无忧计划 | `wyjh.py` |
 | 电信光耀网龄 | `dxgy.py` |
 | 电信好运连连转盘 | `dxhyll.py` |
+| 电信AI奇遇 | `dxai.py` |
 
 各脚本所需环境变量、依赖和定时规则请查看对应文件头部说明。
 
