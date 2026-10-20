@@ -4,6 +4,7 @@
 
 /**
  * Microsoft Rewards Standalone Script
+ * 修订：2026-10-20 v2（任务异常历史、搜索状态、接口响应校验与统计）
  *
  * 一个可在 Node.js 环境下直接运行的微软奖励自动化脚本。
  * 基于对 Microsoft-Rewards-Script (https://github.com/TheNetsky/Microsoft-Rewards-Script)
@@ -288,12 +289,34 @@ const COLORS = {
     gray: '\x1b[90m'
 }
 
+function formatError(error) {
+    const clean = value => String(value ?? '')
+        .replace(/https?:\/\/[^\s?]+\?[^\s]+/gi, '[url-query-redacted]')
+        .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[account]')
+        .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+        .replace(/((?:access_token|refresh_token|id_token|password|authorization|cookie)\s*[=:]\s*)[^\s,}]+/gi, '$1[redacted]')
+        .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b/g, '[token]')
+        .replace(/\b[a-f0-9]{32,}\b/gi, '[id]')
+        .slice(0, 240)
+    if (typeof error === 'string') return clean(error) || 'Unknown error'
+    const parts = [error?.name, error?.code, error?.response?.status ? `HTTP ${error.response.status}` : '',
+        error?.message, error?.cause?.code, error?.cause?.message].filter(Boolean)
+    return [...new Set(parts.map(clean))].join(' | ') || 'Unknown error (no message)'
+}
+
+function pointValue(value) {
+    if (!['number', 'string'].includes(typeof value) || (typeof value === 'string' && !value.trim())) return null
+    const number = Number(value)
+    return Number.isSafeInteger(number) && number >= 0 ? number : null
+}
+
 class Logger {
     constructor(options = {}) {
         this.level = options.level || 'info'
         this.enableColors = options.colors !== false && process.stdout.isTTY
         this.logFile = options.logFile || null
         this.account = options.account || 'main'
+        this.issues = []
         this.levels = { debug: 0, info: 1, warn: 2, error: 3 }
     }
 
@@ -312,6 +335,7 @@ class Logger {
     }
 
     _write(level, tag, message, color) {
+        if (level === 'warn' || level === 'error') this.issues.push({ level, tag })
         if (!this._shouldLog(level)) return
         const formatted = this._format(level, tag, message, color)
         console.log(formatted)
@@ -356,6 +380,9 @@ function createDefaultConfig() {
         headless: true,
         globalTimeout: 30000,
         debugLogs: false,
+
+        //
+        referral: { enabled: true, code: 'A97B601D', source: 'rafsrchae' },
 
         // 浏览器设置
         browser: {
@@ -426,7 +453,7 @@ function loadConfigFile(filePath) {
             return JSON.parse(raw)
         }
     } catch (error) {
-        console.error(`加载配置文件失败 ${filePath}: ${error.message}`)
+        console.error(`加载配置文件失败 ${filePath}: ${formatError(error)}`)
     }
     return null
 }
@@ -440,7 +467,7 @@ function loadAccountsFile(filePath) {
             if (data.accounts && Array.isArray(data.accounts)) return data.accounts
         }
     } catch (error) {
-        console.error(`加载账户文件失败 ${filePath}: ${error.message}`)
+        console.error(`加载账户文件失败 ${filePath}: ${formatError(error)}`)
     }
     return null
 }
@@ -466,17 +493,18 @@ class HttpClient {
                     this.instance.defaults.proxy = false
                 }
             } catch (error) {
-                logger.warn('HTTP', `代理配置失败: ${error.message}`)
+                logger.warn('HTTP', `代理配置失败: ${formatError(error)}`)
             }
         }
 
         // 配置重试
         if (axiosRetry) {
             axiosRetry(this.instance, {
-                retries: 5,
+                retries: 2,
                 retryDelay: axiosRetry.exponentialDelay,
                 shouldResetTimeout: true,
                 retryCondition: error => {
+                    if (!['get', 'head'].includes(String(error.config?.method || '').toLowerCase())) return false
                     if (axiosRetry.isNetworkError(error)) return true
                     if (!error.response) return true
                     const status = error.response.status
@@ -555,13 +583,29 @@ class HttpClient {
                     return null
             }
         } catch (error) {
-            this.logger.warn('HTTP', `创建代理 agent 失败: ${error.message}`)
+            this.logger.warn('HTTP', `创建代理 agent 失败: ${formatError(error)}`)
             return null
         }
     }
 
     async request(config) {
-        return this.instance.request(config)
+        const readOnly = ['GET', 'HEAD'].includes(String(config.method || 'GET').toUpperCase())
+        if (!readOnly) {
+            config = { ...config, 'axios-retry': { ...config['axios-retry'], retries: 0 } }
+        }
+        if (axiosRetry || !readOnly) return this.instance.request(config)
+        // axios-retry 是可选依赖；未安装时仍为只读请求提供有界重试。
+        const requestedRetries = config['axios-retry']?.retries ?? 2
+        const retries = Number.isInteger(requestedRetries) ? Math.max(0, Math.min(2, requestedRetries)) : 0
+        for (let attempt = 0; ; attempt++) {
+            try { return await this.instance.request(config) }
+            catch (error) {
+                const status = error.response?.status
+                if (attempt >= retries || (status && status !== 429 && !(status >= 500 && status <= 599))) throw error
+                this.logger.warn('HTTP-READ', `只读请求暂时失败，重试 ${attempt + 1}/${retries} | ${formatError(error)}`)
+                await wait(500 * 2 ** attempt)
+            }
+        }
     }
 }
 
@@ -587,10 +631,12 @@ class SessionManager {
             const file = this._getCookieFile(email, isMobile)
             if (fs.existsSync(file)) {
                 const data = await fs.promises.readFile(file, 'utf-8')
-                return JSON.parse(data)
+                const cookies = JSON.parse(data)
+                const now = Date.now() / 1000
+                return Array.isArray(cookies) ? cookies.filter(cookie => !Number.isFinite(cookie.expires) || cookie.expires <= 0 || cookie.expires > now) : []
             }
         } catch (error) {
-            this.logger.debug('SESSION', `加载 cookies 失败: ${error.message}`)
+            this.logger.debug('SESSION', `加载 cookies 失败: ${formatError(error)}`)
         }
         return []
     }
@@ -599,13 +645,16 @@ class SessionManager {
         try {
             const dir = this._getSessionDir(email)
             if (!fs.existsSync(dir)) {
-                await fs.promises.mkdir(dir, { recursive: true })
+                await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
             }
             const file = this._getCookieFile(email, isMobile)
-            await fs.promises.writeFile(file, JSON.stringify(cookies, null, 2))
+            const temporary = `${file}.${crypto.randomBytes(6).toString('hex')}.tmp`
+            await fs.promises.writeFile(temporary, JSON.stringify(cookies, null, 2), { mode: 0o600 })
+            await fs.promises.chmod(temporary, 0o600)
+            await fs.promises.rename(temporary, file)
             this.logger.debug('SESSION', `已保存 ${cookies.length} 个 cookies 到 ${file}`)
         } catch (error) {
-            this.logger.warn('SESSION', `保存 cookies 失败: ${error.message}`)
+            this.logger.warn('SESSION', `保存 cookies 失败: ${formatError(error)}`)
         }
     }
 
@@ -657,62 +706,80 @@ class ReactParser {
         this.logger = logger
     }
 
-    // 拼接 __next_f flight chunks
+    // 上游 46f5d75/994dc51：合并 /earn 与 /dashboard 的独立 Flight 数据源。
     concatFlightChunks(html) {
         try {
             const pushRe = /self\.__next_f\.push\(\[1,\s*"((?:[^"\\]|\\.)*)"\]\)/g
+            const pages = typeof html === 'string' ? [html] : (Array.isArray(html) ? html : [])
             let combined = ''
             let count = 0
-            for (const match of html.matchAll(pushRe)) {
-                try {
-                    combined += JSON.parse(`"${match[1]}"`)
-                    count++
-                } catch (err) {
-                    this.logger?.debug('REACT-PARSE', `跳过无法解码的 flight chunk: ${err.message}`)
+            for (const page of pages) {
+                if (typeof page !== 'string') continue
+                let pageChunks = 0
+                for (const match of page.matchAll(pushRe)) {
+                    try {
+                        combined += JSON.parse(`"${match[1]}"`)
+                        count++
+                        pageChunks++
+                    } catch (error) {
+                        this.logger?.debug('REACT-PARSE', `跳过无法解码的 flight chunk: ${formatError(error)}`)
+                    }
                 }
+                if (pageChunks) combined += '\n'
             }
             if (count === 0) {
                 this.logger?.warn('REACT-PARSE', '未找到 __next_f flight chunks - 页面可能不是 RSC 渲染或标记已变更')
             }
             return combined
         } catch (error) {
-            this.logger?.error('REACT-PARSE', `拼接 flight chunks 失败: ${error.message}`)
+            this.logger?.error('REACT-PARSE', `拼接 flight chunks 失败: ${formatError(error)}`)
             return ''
         }
     }
 
-    // 通过锚点字符串定位并提取 JSON 对象
+    // 上游 ReactFunc.extractObjects：从内层对象向外回溯，避免嵌套属性截断对象。
     extractObjects(combined, anchor) {
         const out = []
-        let i = 0
+        const anchorKey = anchor.replace(/^"|"$/g, '')
+        let cursor = 0
         let failures = 0
-        while ((i = combined.indexOf(anchor, i)) !== -1) {
-            const start = combined.lastIndexOf('{', i)
-            if (start === -1) { i += anchor.length; continue }
-            let depth = 0
-            let end = -1
-            let inStr = false
-            let esc = false
-            for (let j = start; j < combined.length; j++) {
-                const c = combined[j]
-                if (esc) { esc = false; continue }
-                if (c === '\\') { esc = true; continue }
-                if (c === '"') { inStr = !inStr; continue }
-                if (inStr) continue
-                if (c === '{') depth++
-                else if (c === '}') {
-                    depth--
-                    if (depth === 0) { end = j; break }
+        while (cursor < combined.length) {
+            const anchorIndex = combined.indexOf(anchor, cursor)
+            if (anchorIndex === -1) break
+            cursor = anchorIndex + anchor.length
+            let start = combined.lastIndexOf('{', anchorIndex)
+            let extracted = false
+            while (start !== -1) {
+                let depth = 0
+                let end = -1
+                let inStr = false
+                let esc = false
+                for (let j = start; j < combined.length; j++) {
+                    const c = combined[j]
+                    if (esc) { esc = false; continue }
+                    if (inStr && c === '\\') { esc = true; continue }
+                    if (c === '"') { inStr = !inStr; continue }
+                    if (inStr) continue
+                    if (c === '{') depth++
+                    else if (c === '}') {
+                        depth--
+                        if (depth === 0) { end = j; break }
+                    }
                 }
+                if (end >= anchorIndex) {
+                    try {
+                        const parsed = JSON.parse(combined.slice(start, end + 1).replace(/"\$undefined"/g, 'null'))
+                        if (Object.prototype.hasOwnProperty.call(parsed, anchorKey)) {
+                            out.push(parsed)
+                            cursor = Math.max(cursor, end + 1)
+                            extracted = true
+                            break
+                        }
+                    } catch {}
+                }
+                start = combined.lastIndexOf('{', start - 1)
             }
-            if (end === -1) break
-            const raw = combined.slice(start, end + 1)
-            i = end
-            try {
-                out.push(JSON.parse(raw.replace(/"\$undefined"/g, 'null')))
-            } catch {
-                failures++
-            }
+            if (!extracted) failures++
         }
         if (failures > 0) {
             this.logger?.debug('REACT-PARSE', `extractObjects("${anchor}") 有 ${failures} 个无法解析的匹配`)
@@ -720,22 +787,25 @@ class ReactParser {
         return out
     }
 
-    // 解析所有 offers（从 /earn 页面）
+    // 上游 ReactFunc.parseOffers：多页按 offerId 合并，保守保留完成与锁定状态。
     parseOffers(combined) {
         try {
-            const seen = new Set()
             const today = this._todayStamp()
-            const offers = []
+            const offers = new Map()
             for (const obj of this.extractObjects(combined, '"offerId"')) {
                 const offerId = obj.offerId
-                if (!offerId || seen.has(offerId)) continue
-                seen.add(offerId)
-                const hash = obj.hash ?? null
-                const isCompleted = (obj.isCompleted ?? obj.complete) === true
+                if (typeof offerId !== 'string' || !offerId) continue
+                const hash = typeof obj.hash === 'string' && obj.hash.trim() ? obj.hash : null
+                const isCompleted = obj.isCompleted === true || obj.complete === true
                 const isLocked = obj.isLocked === true
                 const date = this._normaliseDate(obj.date)
-                const reportable = !!hash && !isCompleted && !isLocked && (date === null || date <= today)
-                offers.push({
+                const attributes = obj.attributes && typeof obj.attributes === 'object' ? obj.attributes : null
+                const activityTypeValue = obj.activityType ?? obj.activity_type ?? attributes?.activityType ?? attributes?.activity_type
+                const parsedActivityType = Number(activityTypeValue)
+                const promotionalValue = obj.isPromotional ?? attributes?.promotional
+                const isPromotional = promotionalValue === true ||
+                    (typeof promotionalValue === 'string' && promotionalValue.toLowerCase() === 'true')
+                const candidate = {
                     offerId,
                     hash,
                     title: obj.title ?? '',
@@ -744,17 +814,36 @@ class ReactParser {
                     promotionSubtype: obj.promotionSubtype ?? null,
                     destination: obj.destination ?? obj.destinationUrl ?? '',
                     isCompleted,
-                    isPromotional: obj.isPromotional === true,
+                    isPromotional,
                     isLocked,
                     unlockCriteria: obj.unlockCriteria ?? null,
                     date,
-                    activityType: null,
-                    reportable
-                })
+                    activityType: Number.isInteger(parsedActivityType) && parsedActivityType > 0 ? parsedActivityType : null,
+                    reportable: !!hash && !isCompleted && !isLocked && (date === null || date <= today)
+                }
+                const existing = offers.get(offerId)
+                if (!existing) {
+                    offers.set(offerId, candidate)
+                    continue
+                }
+                existing.hash ||= candidate.hash
+                existing.title ||= candidate.title
+                existing.description ||= candidate.description
+                existing.points ||= candidate.points
+                existing.promotionSubtype ??= candidate.promotionSubtype
+                existing.destination ||= candidate.destination
+                existing.isCompleted ||= candidate.isCompleted
+                existing.isPromotional ||= candidate.isPromotional
+                existing.isLocked ||= candidate.isLocked
+                existing.unlockCriteria ??= candidate.unlockCriteria
+                existing.date ??= candidate.date
+                existing.activityType ??= candidate.activityType
+                existing.reportable = !!existing.hash && !existing.isCompleted && !existing.isLocked &&
+                    (existing.date === null || existing.date <= today)
             }
-            return offers
+            return [...offers.values()]
         } catch (error) {
-            this.logger?.error('REACT-PARSE', `解析 offers 失败: ${error.message}`)
+            this.logger?.error('REACT-PARSE', `解析 offers 失败: ${formatError(error)}`)
             return []
         }
     }
@@ -771,7 +860,7 @@ class ReactParser {
                 remainingDays: withDays ? withDays.remainingDays : null
             }
         } catch (error) {
-            this.logger?.error('REACT-PARSE', `解析 streak protection 失败: ${error.message}`)
+            this.logger?.error('REACT-PARSE', `解析 streak protection 失败: ${formatError(error)}`)
             return null
         }
     }
@@ -795,7 +884,7 @@ class ReactParser {
             const byPartner = new Map(streaks.map(s => [s.partner, s]))
             return [...byPartner.values()]
         } catch (error) {
-            this.logger?.error('REACT-PARSE', `解析 streaks 失败: ${error.message}`)
+            this.logger?.error('REACT-PARSE', `解析 streaks 失败: ${formatError(error)}`)
             return []
         }
     }
@@ -849,7 +938,7 @@ class ReactParser {
             this.logger?.info('REACT-PARSE', `Quest 列表 | parents=${out.length} | incomplete=${out.filter(q => !q.complete).length}`)
             return out
         } catch (error) {
-            this.logger?.error('REACT-PARSE', `解析 quest 列表失败: ${error.message}`)
+            this.logger?.error('REACT-PARSE', `解析 quest 列表失败: ${formatError(error)}`)
             return []
         }
     }
@@ -882,7 +971,7 @@ class ReactParser {
             this.logger?.info('REACT-PARSE', `Quest 页快照 | children=${out.length} | reportable=${out.filter(c => c.reportable).length}`)
             return out
         } catch (error) {
-            this.logger?.error('REACT-PARSE', `解析 quest 页失败: ${error.message}`)
+            this.logger?.error('REACT-PARSE', `解析 quest 页失败: ${formatError(error)}`)
             return []
         }
     }
@@ -899,38 +988,49 @@ class ReactParser {
         return encodeURIComponent(JSON.stringify(tree))
     }
 
-    // 从 JS chunk 提取 Server Action id（createServerReference）
+    // 上游 bf9466ab：兼容 Webpack 与 Turbopack 的 Server Action 声明。
     extractActionIds(jsText) {
         const byName = {}
         const all = new Set()
         const HEX = '[a-f0-9]{40,64}'
-        const KNOWN_NON_NAMES = new Set(['callServer', 'findSourceMapURL', 'encodeFormAction'])
+        const KNOWN_NON_NAMES = new Set(['callServer', 'findSourceMapURL', 'encodeFormAction', 'default'])
         try {
-            const callRegex = new RegExp(`createServerReference\\s*\\)?\\s*\\(\\s*"(${HEX})"([\\s\\S]{0,400}?)\\)`, 'g')
+            const createRegex = new RegExp(`createServerReference\\s*\\)?\\s*\\(\\s*"(${HEX})"([\\s\\S]{0,800}?)\\)`, 'g')
+            const registerRegex = new RegExp(`registerServerReference\\s*\\)?\\s*\\([^,]+,\\s*"(${HEX})"([\\s\\S]{0,800}?)\\)`, 'g')
             const strLitRe = /"([A-Za-z_$][\w$]*)"/g
-            for (const m of jsText.matchAll(callRegex)) {
-                const id = m[1]
-                const argsBlock = m[2] ?? ''
-                all.add(id)
-                const candidates = [...argsBlock.matchAll(strLitRe)].map(x => x[1]).filter(n => !KNOWN_NON_NAMES.has(n))
-                if (candidates.length) byName[candidates[candidates.length - 1]] = id
+            const processMatches = matches => {
+                for (const m of matches) {
+                    const id = m[1]
+                    all.add(id)
+                    const candidates = [...(m[2] ?? '').matchAll(strLitRe)]
+                        .map(x => x[1]).filter(n => !KNOWN_NON_NAMES.has(n) && n.length > 3)
+                    if (candidates.length) byName[candidates[candidates.length - 1]] = id
+                }
             }
-            const bareRegex = new RegExp(`createServerReference\\s*\\)?\\s*\\(\\s*"(${HEX})"`, 'g')
-            for (const m of jsText.matchAll(bareRegex)) all.add(m[1])
+            processMatches(jsText.matchAll(createRegex))
+            processMatches(jsText.matchAll(registerRegex))
+            const bareCreateRegex = new RegExp(`createServerReference\\s*\\)?\\s*\\(\\s*"(${HEX})"`, 'g')
+            const bareRegisterRegex = new RegExp(`registerServerReference\\s*\\)?\\s*\\([^,]+,\\s*"(${HEX})"`, 'g')
+            for (const m of jsText.matchAll(bareCreateRegex)) all.add(m[1])
+            for (const m of jsText.matchAll(bareRegisterRegex)) all.add(m[1])
             const actionIdRe = new RegExp(`\\$ACTION_ID_(${HEX})`, 'g')
             for (const m of jsText.matchAll(actionIdRe)) all.add(m[1])
         } catch (error) {
-            this.logger?.error('REACT-PARSE', `提取 action ids 失败: ${error.message}`)
+            this.logger?.error('REACT-PARSE', `提取 action ids 失败: ${formatError(error)}`)
         }
         return { byName, all: [...all] }
     }
 
-    // 提取 buildId
+    // 上游 ReactFunc.buildId：优先使用部署 dpl，兼容非固定长度的 build ID。
     buildId(html) {
-        const combined = this.concatFlightChunks(html)
-        return combined.match(/"buildId":"([A-Za-z0-9_-]{21})"/)?.[1] ??
-            combined.match(/"b":"([A-Za-z0-9_-]{21})"/)?.[1] ??
-            html.match(/\/_next\/static\/([A-Za-z0-9_-]{21})\//)?.[1] ?? null
+        const pages = typeof html === 'string' ? [html] : (Array.isArray(html) ? html : [])
+        const raw = pages.filter(p => typeof p === 'string').join('\n')
+        const combined = this.concatFlightChunks(pages)
+        return raw.match(/[?&](?:amp;)?dpl=([A-Za-z0-9._-]+)/i)?.[1] ??
+            combined.match(/[?&](?:amp;)?dpl=([A-Za-z0-9._-]+)/i)?.[1] ??
+            combined.match(/"buildId":"([A-Za-z0-9._-]+)"/)?.[1] ??
+            combined.match(/"b":"([A-Za-z0-9._-]{8,})"/)?.[1] ??
+            raw.match(/\/_next\/static\/([A-Za-z0-9._-]+)\//)?.[1] ?? null
     }
 
     _isParentQuestId(offerId) {
@@ -996,11 +1096,11 @@ class BrowserManager {
         try {
             browser = await playwright.chromium.launch(launchOptions)
         } catch (error) {
-            this.logger.error('BROWSER', `浏览器启动失败: ${error.message}`)
+            this.logger.error('BROWSER', `浏览器启动失败: ${formatError(error)}`)
             this.logger.error('BROWSER', `尝试的路径: ${launchOptions.executablePath || '(Playwright 默认)'}`)
             this._logPlaywrightCacheInfo()
             // 如果是 ENOENT 错误，检查动态链接库（Linux 常见问题）
-            if (error.message.includes('ENOENT') && launchOptions.executablePath && process.platform !== 'win32') {
+            if (formatError(error).includes('ENOENT') && launchOptions.executablePath && process.platform !== 'win32') {
                 this._checkSharedLibraries(launchOptions.executablePath)
             }
             throw error
@@ -1190,11 +1290,11 @@ class BrowserManager {
                             }
                         }
                     } catch (e) {
-                        this.logger.error('BROWSER', `  ${dir}/ 读取失败: ${e.message}`)
+                        this.logger.error('BROWSER', `  ${dir}/ 读取失败: ${formatError(e)}`)
                     }
                 }
             } catch (e) {
-                this.logger.error('BROWSER', `  读取失败: ${e.message}`)
+                this.logger.error('BROWSER', `  读取失败: ${formatError(e)}`)
             }
         }
 
@@ -1220,7 +1320,7 @@ class BrowserManager {
             const stats = fs.statSync(execPath)
             this.logger.error('BROWSER', `文件权限: ${(stats.mode & 0o777).toString(8)} | 大小: ${stats.size} 字节`)
         } catch (e) {
-            this.logger.error('BROWSER', `无法获取文件信息: ${e.message}`)
+            this.logger.error('BROWSER', `无法获取文件信息: ${formatError(e)}`)
             return
         }
 
@@ -1300,7 +1400,7 @@ class BrowserManager {
                 }
             }
         } catch (e) {
-            this.logger.error('BROWSER', `ELF 头分析失败: ${e.message}`)
+            this.logger.error('BROWSER', `ELF 头分析失败: ${formatError(e)}`)
         }
 
         // 尝试 ldd（如果可用）
@@ -1327,7 +1427,7 @@ class BrowserManager {
                 this.logger.error('BROWSER', '所有依赖库均已找到')
             }
         } catch (e) {
-            this.logger.error('BROWSER', `ldd 命令不可用: ${e.message}`)
+            this.logger.error('BROWSER', `ldd 命令不可用: ${formatError(e)}`)
             this.logger.error('BROWSER', '你的系统可能是 Alpine Linux 或精简版，缺少 file/ldd 工具')
             this.logger.error('BROWSER', '建议使用 Docker 的 node:20-slim 镜像运行此脚本')
         }
@@ -1340,10 +1440,10 @@ class BrowserManager {
             } else {
                 this.logger.error('BROWSER', `直接运行失败，状态码: ${result.status}`)
                 if (result.stderr) this.logger.error('BROWSER', `错误输出: ${result.stderr.trim()}`)
-                if (result.error) this.logger.error('BROWSER', `错误: ${result.error.message}`)
+                if (result.error) this.logger.error('BROWSER', `错误: ${result.formatError(error)}`)
             }
         } catch (e) {
-            this.logger.error('BROWSER', `直接运行异常: ${e.message}`)
+            this.logger.error('BROWSER', `直接运行异常: ${formatError(e)}`)
         }
 
         this.logger.error('BROWSER', '====================================')
@@ -1396,11 +1496,11 @@ class LoginManager {
         }
     }
 
-    async login(page, account) {
+    async login(page, account, options = {}) {
         this.logger.info('LOGIN', `开始登录流程: ${account.email}`)
 
         await page
-            .goto('https://rewards.bing.com/createuser?idru=%2F&userScenarioId=anonsignin', {
+            .goto(options.entryUrl || 'https://rewards.bing.com/createuser?idru=%2F&userScenarioId=anonsignin', {
                 waitUntil: 'domcontentloaded'
             })
             .catch(() => {})
@@ -1419,6 +1519,10 @@ class LoginManager {
             this.logger.debug('LOGIN', `状态检查 ${iteration}/${maxIterations}`)
 
             const state = await this._detectState(page, account)
+            //
+            if (options.entryUrl && state === 'CHROMEWEBDATA_ERROR') {
+                throw new Error('登录页面加载失败')
+            }
             this.logger.debug('LOGIN', `当前状态: ${state}`)
 
             if (state === previousState && state !== 'LOGGED_IN' && state !== 'UNKNOWN') {
@@ -1452,7 +1556,8 @@ class LoginManager {
             throw new Error('登录超时：超过最大迭代次数')
         }
 
-        await this._finalizeLogin(page, account.email)
+        if (options.onAuthenticated) await options.onAuthenticated(page)
+        if (options.finalize !== false) await this._finalizeLogin(page, account.email)
     }
 
     /**
@@ -1488,6 +1593,12 @@ class LoginManager {
 
         const isLocked = await this._checkSelector(page, this.selectors.accountLocked)
         if (isLocked) return 'ACCOUNT_LOCKED'
+
+        // Microsoft may offer an email code before showing other login methods.
+        if (url.hostname === 'login.live.com' &&
+            await this._checkSelector(page, 'text="Get a code to sign in"')) {
+            return 'EMAIL_CODE_OFFER'
+        }
 
         if (url.hostname === 'rewards.bing.com' || url.hostname === 'account.microsoft.com') {
             return 'LOGGED_IN'
@@ -1562,6 +1673,12 @@ class LoginManager {
 
     async _handleState(state, page, account) {
         switch (state) {
+            case 'EMAIL_CODE_OFFER': {
+                this.logger.info('LOGIN', '选择其他登录方式')
+                await page.getByText('Other ways to sign in', { exact: true }).click()
+                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
+                return true
+            }
             case 'ACCOUNT_LOCKED': {
                 this.logger.error('LOGIN', '账户已被锁定！请从配置中移除并重启！')
                 throw new Error('账户已被锁定')
@@ -1671,7 +1788,7 @@ class LoginManager {
                     this.logger.warn('LOGIN', '等待 60 秒让你在手机上完成验证...')
                     await wait(60000)
                 } catch (e) {
-                    this.logger.error('LOGIN', `截图失败: ${e.message}`)
+                    this.logger.error('LOGIN', `截图失败: ${formatError(e)}`)
                     this.logger.warn('LOGIN', '请手动处理验证，等待 60 秒...')
                     await wait(60000)
                 }
@@ -1752,7 +1869,7 @@ class LoginManager {
             })
             return totp.generate()
         } catch (error) {
-            this.logger.error('LOGIN', `TOTP 生成失败: ${error.message}`)
+            this.logger.error('LOGIN', `TOTP 生成失败: ${formatError(error)}`)
             throw error
         }
     }
@@ -1769,7 +1886,7 @@ class LoginManager {
             this.bot.cookies = freshCookies
             this.logger.debug(tag, `${desc} cookies 已更新 | cookies 数量: ${freshCookies.length}`)
         } catch (e) {
-            this.logger.warn(tag, `更新 cookies 失败: ${e.message}`)
+            this.logger.warn(tag, `更新 cookies 失败: ${formatError(e)}`)
         }
     }
 
@@ -1821,7 +1938,7 @@ class LoginManager {
             // 这些 cookies 对于 API 返回完整的促销数据至关重要
             await this._updateCookiesFromContext(page, 'LOGIN-BING', 'Bing 会话')
         } catch (error) {
-            this.logger.warn('LOGIN-BING', `Bing 会话验证错误: ${error.message}`)
+            this.logger.warn('LOGIN-BING', `Bing 会话验证错误: ${formatError(error)}`)
         }
     }
 
@@ -1860,7 +1977,7 @@ class LoginManager {
                         }
 
                         if (this.bot.requestToken) {
-                            this.logger.info('GET-REWARD-SESSION', `请求令牌已获取: ${this.bot.requestToken.substring(0, 10)}...`)
+                            this.logger.info('GET-REWARD-SESSION', `请求令牌已获取: ${'[redacted]'}...`)
                         } else {
                             // Script-4：现代 RSC 仪表盘不再在 HTML 中渲染 token input/meta 标签，
                             // 所有上报通过 Server Action 机制（Next-Action header），不依赖 RequestVerificationToken
@@ -1883,7 +2000,7 @@ class LoginManager {
                 const tokenEl = await page.$(this.selectors.requestToken).catch(() => null)
                 if (tokenEl) {
                     this.bot.requestToken = await tokenEl.inputValue()
-                    this.logger.info('GET-REWARD-SESSION', `请求令牌已获取（备用）: ${this.bot.requestToken.substring(0, 10)}...`)
+                    this.logger.info('GET-REWARD-SESSION', `请求令牌已获取（备用）: ${'[redacted]'}...`)
                 }
                 this.logger.warn('GET-REWARD-SESSION', '未到达奖励首页，会话初始化可能不完整')
             }
@@ -1896,7 +2013,7 @@ class LoginManager {
 
             this.logger.info('GET-REWARD-SESSION', '奖励会话初始化完成')
         } catch (error) {
-            this.logger.warn('GET-REWARD-SESSION', `奖励会话初始化错误: ${error.message}`)
+            this.logger.warn('GET-REWARD-SESSION', `奖励会话初始化错误: ${formatError(error)}`)
         }
     }
 
@@ -1922,7 +2039,7 @@ class LoginManager {
                     await wait(5000)
                 }
             } catch (error) {
-                this.logger.warn('AUTH', `OAuth 尝试 ${attempt} 异常: ${error.message}`)
+                this.logger.warn('AUTH', `OAuth 尝试 ${attempt} 异常: ${formatError(error)}`)
                 if (attempt < 3) {
                     await wait(5000)
                 }
@@ -1945,7 +2062,7 @@ class LoginManager {
 
         // 使用更长的导航超时（60 秒）
         await page.goto(authorizeUrl.href, { timeout: 60000, waitUntil: 'domcontentloaded' }).catch(e => {
-            this.logger.debug('AUTH', `OAuth 导航: ${e.message}`)
+            this.logger.debug('AUTH', `OAuth 导航: ${formatError(e)}`)
         })
 
         const start = Date.now()
@@ -2024,119 +2141,93 @@ class RewardsManager {
     /**
      * 获取桌面仪表盘数据
      */
-    async getDashboardData() {
-        // 如果有缓存且在 30 秒内，优先返回缓存（减少 API 调用，避免 ECONNRESET）
-        const now = Date.now()
-        if (this._dashboardCache && this._dashboardCacheTime && (now - this._dashboardCacheTime) < 30000) {
-            this.logger.debug('DASHBOARD', '使用缓存的仪表盘数据')
-            return this._dashboardCache
+
+    _readDashboardBalance(data) {
+        return pointValue(data?.userStatus?.availablePoints)
+    }
+
+    _storeDashboard(data, source, partial = false) {
+        if (!data || typeof data !== 'object' || !data.userStatus ||
+            (this._readDashboardBalance(data) === null && !data.userStatus.counters)) {
+            throw new Error('Rewards dashboard is missing valid account data')
         }
+        if (data.userStatus.isRewardsUser === false) throw new Error('Rewards profile is not enrolled')
+        if ((data.userWarnings || []).some(item => /Fraud_UserWarning|suspend|account.?restrict/i.test(String(item?.name || item?.code || '')))) {
+            throw new Error('官方返回账户限制提示，停止自动处理')
+        }
+        this._dashboardCache = data
+        this._dashboardCacheTime = Date.now()
+        this.dashboardMeta = { source, partial, stale: false, fetchedAt: this._dashboardCacheTime }
+        this.logger.debug('DASHBOARD', `面板已刷新 | source=${source} | partial=${partial}`)
+        return data
+    }
 
-        const cookieHeader = this.bot.sessionManager.buildCookieHeader(this.bot.cookies, COMMON_COOKIE_DOMAINS)
+    _mapFlyout(data) {
+        const info = data?.userInfo
+        const flyout = data?.flyoutResult
+        const status = flyout?.userStatus
+        if (data?.isError || info?.isRewardsUser !== true || status?.isRewardsUser !== true || !info.profile) {
+            throw new Error('Bing flyout response is not an authenticated Rewards profile')
+        }
+        const rawCounters = status.counters || {}
+        const counters = { ...rawCounters }
+        for (const [lower, upper] of [['pcSearch', 'PCSearch'], ['mobileSearch', 'MobileSearch'], ['activityAndQuiz', 'ActivityAndQuiz'], ['dailyPoint', 'DailyPoint']]) {
+            if (Object.hasOwn(rawCounters, lower) || Object.hasOwn(rawCounters, upper)) counters[lower] = rawCounters[lower] ?? rawCounters[upper]
+        }
+        const balance = pointValue(status.availablePoints) ?? pointValue(info.balance)
+        if (balance === null) throw new Error('Bing flyout balance is missing')
+        const dashboard = { ...flyout, userProfile: info.profile, userStatus: { ...status, availablePoints: balance, counters } }
+        const containers = ['promotionalItems', 'highValueActionPromotions', 'edgeHighValueActionPromotions', 'exploreOnBingPromotions', 'exploreOnOutlookPromotions', 'onboardingChecklistPromotions']
+        const items = containers.flatMap(key => Array.isArray(flyout[key]) ? flyout[key] : [])
+        if (items.length) dashboard.promotionalItems = [...new Map(items.filter(Boolean).map(item => [item.offerId, item])).values()]
+        return dashboard
+    }
 
-        // 使用完整的浏览器指纹头（与 EXE 一致）
-        // 这些头对于 API 返回完整的促销数据至关重要（包括 Evergreen 类型的 More Promotions 活动）
-        // Script-4 整合：使用 generateMobileFingerprintHeaders() 随机机型，避免固定 Pixel 8
-        const fingerprintHeaders = generateMobileFingerprintHeaders()
-
-        // 最多重试 3 次
-        let lastError = null
-        for (let attempt = 1; attempt <= 3; attempt++) {
+    async getDashboardData(options = {}) {
+        const fresh = options.fresh === true
+        const allowStale = options.allowStale !== false
+        const now = Date.now()
+        if (!fresh && this._dashboardCache && now - this._dashboardCacheTime < 30000) return this._dashboardCache
+        const cookies = this._activeIsMobile === false && this.bot.desktopCookies?.length ? this.bot.desktopCookies : this.bot.cookies
+        const cookieHeader = this.bot.sessionManager.buildCookieHeader(cookies, COMMON_COOKIE_DOMAINS)
+        const headers = { ...(this._activeIsMobile === false ? FINGERPRINT_HEADERS_DESKTOP : generateMobileFingerprintHeaders()), Cookie: cookieHeader,
+            Referer: 'https://rewards.bing.com/', Origin: 'https://rewards.bing.com' }
+        let lastError
+        for (let attempt = 1; attempt <= 2; attempt++) {
             try {
                 const response = await this.bot.httpClient.request({
-                    url: 'https://rewards.bing.com/api/getuserinfo?type=1',
-                    method: 'GET',
-                    headers: {
-                        ...fingerprintHeaders,
-                        Cookie: cookieHeader,
-                        Referer: 'https://rewards.bing.com/',
-                        Origin: 'https://rewards.bing.com'
-                    }
+                    url: URLS.rewards.userInfoApi + '?type=1', method: 'GET', headers,
+                    'axios-retry': { retries: 0 }
                 })
-
-                if (response.data?.dashboard) {
-                    // 缓存成功响应
-                    this._dashboardCache = response.data.dashboard
-                    this._dashboardCacheTime = Date.now()
-                    // 输出关键活动信息，便于对比验证
-                    const dash = response.data.dashboard
-                    const mpCount = dash.morePromotions?.length || 0
-                    const mpwpCount = dash.morePromotionsWithoutPromotionalItems?.length || 0
-                    this.logger.info('DASHBOARD', `仪表盘数据: morePromotions=${mpCount}, morePromotionsWithoutPromotionalItems=${mpwpCount}`)
-                    if (mpCount > 0) {
-                        this.logger.info('DASHBOARD', `morePromotions 列表: ${dash.morePromotions.map(p => p.offerId).join(', ')}`)
-                    }
-                    if (mpwpCount > 0) {
-                        this.logger.info('DASHBOARD', `morePromotionsWithoutPromotionalItems 列表: ${dash.morePromotionsWithoutPromotionalItems.map(p => p.offerId).join(', ')}`)
-                    }
-                    return response.data.dashboard
-                }
-                throw new Error('API 响应中缺少仪表盘数据')
+                const dashboard = response.data?.dashboard ?? (response.data?.userStatus ? response.data : null)
+                if (!dashboard) throw new Error('API response has no dashboard')
+                return this._storeDashboard(dashboard, 'rewards-api')
             } catch (error) {
                 lastError = error
-                // Script-4：EAI_AGAIN/ECONNRESET 等网络错误是临时性的，重试是正常机制
-                // 重试过程中的 WARN 降级为 DEBUG，避免误报；仅在最终全部失败时才输出 WARN
-                const isTransient = /EAI_AGAIN|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(error.message)
-                if (isTransient) {
-                    this.logger.debug('DASHBOARD', `API 获取失败 (尝试 ${attempt}/3): ${error.message}（临时网络错误，将重试）`)
-                } else {
-                    this.logger.warn('DASHBOARD', `API 获取失败 (尝试 ${attempt}/3): ${error.message}`)
-                }
-                if (attempt < 3) {
-                    // Script-4：临时网络错误使用更长的退避时间（5/10/15 秒），给 DNS 恢复时间
-                    const delay = isTransient ? 5000 * attempt : 2000 * attempt
-                    await wait(delay)
-                }
+                if (/官方返回账户限制/.test(String(formatError(error)))) throw error
+                this.logger.debug('DASHBOARD', `主面板读取失败 ${attempt}/2 | ${formatError(error)}`)
+                if (attempt === 1) await wait(1000)
             }
         }
-
-        // 所有重试失败，尝试 HTML 回退
-        this.logger.warn('DASHBOARD', 'API 重试全部失败，尝试 HTML 回退')
         try {
             const response = await this.bot.httpClient.request({
-                url: this.bot.config.baseURL,
-                method: 'GET',
-                headers: {
-                    ...fingerprintHeaders,
-                    Cookie: cookieHeader,
-                    Referer: 'https://rewards.bing.com/'
-                }
+                url: 'https://www.bing.com/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards',
+                method: 'GET', headers: { ...headers, Referer: 'https://www.bing.com/', Origin: 'https://www.bing.com' },
+                'axios-retry': { retries: 0 }
             })
-            const html = String(response.data)
-            // 尝试多种正则匹配（兼容新旧版仪表盘）
-            const patterns = [
-                /var\s+dashboard\s*=\s*({.*?});\s*<\/script>/s,
-                /var\s+dashboard\s*=\s*({.*?});/s,
-                /"dashboard"\s*:\s*({.*?})\s*[,}]/s,
-                /window\.__NEXT_DATA__\s*=\s*({.*?});\s*<\/script>/s
-            ]
-            for (const pattern of patterns) {
-                const match = html.match(pattern)
-                if (match && match[1]) {
-                    try {
-                        const parsed = JSON.parse(match[1])
-                        const dashboard = parsed.dashboard || parsed.props?.pageProps?.dashboard || parsed
-                        if (dashboard.userStatus || dashboard.dailySetPromotions) {
-                            this._dashboardCache = dashboard
-                            this._dashboardCacheTime = Date.now()
-                            return dashboard
-                        }
-                    } catch {
-                        // 继续尝试下一个正则
-                    }
-                }
-            }
-            throw new Error('HTML 中未找到仪表盘脚本')
-        } catch (fallbackError) {
-            // 如果有旧缓存，返回旧缓存（降级处理，避免整个账户失败）
-            if (this._dashboardCache) {
-                // Script-4：有旧缓存可用时降级为 INFO，避免误报 WARN（降级机制正常工作）
-                this.logger.info('DASHBOARD', `HTML 回退失败，使用旧缓存（降级正常）: ${fallbackError.message}`)
-                return this._dashboardCache
-            }
-            this.logger.error('DASHBOARD', `获取仪表盘数据失败: ${fallbackError.message}`)
-            throw fallbackError
+            const result = this._storeDashboard(this._mapFlyout(response.data), 'bing-flyout', true)
+            this.logger.warn('DASHBOARD', '主面板暂不可用，使用部分 Bing 面板；缺失任务状态不视为已完成')
+            return result
+        } catch (error) {
+            lastError = error
+            if (/官方返回账户限制/.test(String(formatError(error)))) throw error
         }
+        if (allowStale && this._dashboardCache) {
+            this.dashboardMeta = { ...this.dashboardMeta, stale: true }
+            this.logger.warn('DASHBOARD', `读取失败，仅提供旧任务快照；不能用于到账确认 | ${formatError(lastError)}`)
+            return this._dashboardCache
+        }
+        throw new Error(`无法取得新鲜面板数据 | ${formatError(lastError)}`)
     }
 
     /**
@@ -2156,7 +2247,7 @@ class RewardsManager {
             })
             return response.data
         } catch (error) {
-            this.logger.error('PANEL', `获取面板数据失败: ${error.message}`)
+            this.logger.error('PANEL', `获取面板数据失败: ${formatError(error)}`)
             throw error
         }
     }
@@ -2180,7 +2271,7 @@ class RewardsManager {
             })
             return response.data
         } catch (error) {
-            this.logger.error('APP-DASHBOARD', `获取应用仪表盘数据失败: ${error.message}`)
+            this.logger.error('APP-DASHBOARD', `获取应用仪表盘数据失败: ${formatError(error)}`)
             throw error
         }
     }
@@ -2188,15 +2279,19 @@ class RewardsManager {
     /**
      * 获取当前积分
      */
-    async getCurrentPoints() {
+
+    async getCurrentPoints(options = {}) {
         try {
-            const data = await this.getDashboardData()
-            const points = data?.userStatus?.availablePoints ?? 0
+            const data = await this.getDashboardData({ fresh: options.fresh !== false, allowStale: false })
+            const points = this._readDashboardBalance(data)
+            if (points === null) throw new Error('新鲜面板未返回有效余额')
             this.bot.currentPoints = points
             return points
         } catch (error) {
-            this.logger.warn('DASHBOARD', `获取当前积分失败，使用缓存值: ${error.message}`)
-            return this.bot.currentPoints ?? 0
+            if (options.required) throw error
+            const lastKnown = pointValue(this.bot.currentPoints)
+            this.logger.warn('DASHBOARD', `余额未确认，保留上次读数 | ${formatError(error)}`)
+            return lastKnown
         }
     }
 
@@ -2209,55 +2304,64 @@ class RewardsManager {
      * 移植自 Script-4 BrowserFunc.bootstrap
      */
     async bootstrap(page, isMobile = true) {
+        this._activeIsMobile = isMobile
+        this._dashboardCache = null
         try {
             this.logger.info('BOOTSTRAP', `初始化 rewards context | isMobile=${isMobile}`)
             await page.goto(URLS.rewards.earn, { waitUntil: 'domcontentloaded', timeout: 30000 })
+
+            // 上游 d0f07d7：仅关闭已识别的欢迎弹层，不点击注册、同意或购买按钮。
+            try {
+                const close = await page.waitForSelector('section[role="dialog"] button[slot="close"]', { timeout: 5000 }).catch(() => null)
+                if (close) {
+                    await close.click({ timeout: 5000 })
+                    this.logger.info('BOOTSTRAP', '已关闭首次访问欢迎窗口')
+                    await page.waitForSelector('section#dailyset', { timeout: 15000 }).catch(() => null)
+                }
+            } catch (error) {
+                this.logger.debug('BOOTSTRAP', `欢迎窗口关闭未完成: ${formatError(error)}`)
+            }
             const earnHtml = await page.content()
-
+            const fetchHtml = async (url, route) => {
+                try {
+                    const res = await page.request.get(url, { timeout: 20000 })
+                    if (res.ok()) return await res.text()
+                    this.logger.warn('BOOTSTRAP', `获取 ${route} HTML 失败 | status=${res.status()}`)
+                } catch (error) {
+                    this.logger.warn('BOOTSTRAP', `获取 ${route} HTML 失败: ${formatError(error)}`)
+                }
+                return ''
+            }
+            // 上游 46f5d75/994dc51：普通 DOM 之外保留原始 RSC，并合并 dashboard。
+            const [earnRaw, dashboardHtml, streaksHtml] = await Promise.all([
+                fetchHtml(URLS.rewards.earn, '/earn'),
+                fetchHtml(URLS.rewards.dashboard, '/dashboard'),
+                fetchHtml(URLS.rewards.earnStreaks, '/earn?section=streaks')
+            ])
+            const sources = [earnRaw, earnHtml, dashboardHtml, streaksHtml].filter(Boolean)
             this.bot.nextRouterStateTree = this.bot.reactParser.routerStateTree('earn')
-            this.bot.reactSnapshot = this.bot.reactParser.snapshotPage(earnHtml)
-
-            // 获取 /dashboard HTML 以捕获 /earn 未显示的 chunks
-            let dashboardHtml = ''
-            try {
-                const res = await page.request.get(URLS.rewards.dashboard)
-                if (res.ok()) {
-                    dashboardHtml = await res.text()
-                } else {
-                    this.logger.warn('BOOTSTRAP', `获取 /dashboard HTML 失败 | status=${res.status()}`)
-                }
-            } catch (error) {
-                this.logger.warn('BOOTSTRAP', `获取 /dashboard HTML 失败: ${error.message}`)
-            }
-
-            // Script-4 扩展：获取 /earn?section=streaks HTML 以捕获 streak protection 相关 chunks
-            let streaksHtml = ''
-            try {
-                const res = await page.request.get(URLS.rewards.earnStreaks)
-                if (res.ok()) {
-                    streaksHtml = await res.text()
-                }
-            } catch (error) {
-                this.logger.debug('BOOTSTRAP', `获取 /earn?section=streaks HTML 失败: ${error.message}`)
-            }
-
-            // 从 chunks 中发现 action ids
-            this.bot.nextActions = await this._resolveActionIds(page, [earnHtml, dashboardHtml, streaksHtml])
-
+            this.bot.reactSnapshot = this.bot.reactParser.snapshotPage(sources)
+            this.bot.nextActions = await this._resolveActionIds(page, sources)
+            const buildId = this.bot.reactParser.buildId(sources)
+            this.bot.rewardsDeploymentId = buildId ?? ''
             const actionsCount = Object.keys(this.bot.nextActions).length
             const reportableCount = this.bot.reactSnapshot?.reportable?.length ?? 0
-            this.logger.info('BOOTSTRAP', `Context 就绪 | actions=${actionsCount} | reportable=${reportableCount} | buildId=${this.bot.reactParser.buildId(earnHtml) ?? 'unknown'}`)
-            this.logger.debug('BOOTSTRAP', `已发现 action ids: [${Object.keys(this.bot.nextActions).join(', ')}]`)
-
-            if (!actionsCount) {
-                this.logger.warn('BOOTSTRAP', '未发现 action ids - server-action 调用将失败')
-            }
-            if (!this.bot.reactSnapshot?.offers?.length) {
-                this.logger.warn('BOOTSTRAP', '未解析到 offers - /earn 页面可能未渲染 RSC payload')
-            }
+            this.logger.info('BOOTSTRAP', `Context 就绪 | actions=${actionsCount} | reportable=${reportableCount} | buildId=${buildId ?? 'unknown'}`)
+            if (!actionsCount) this.logger.warn('BOOTSTRAP', '未发现 action ids - 本轮跳过依赖 server-action 的任务')
+            if (!this.bot.reactSnapshot?.offers?.length) this.logger.warn('BOOTSTRAP', '未解析到 offers - 页面数据可能不完整')
         } catch (error) {
-            this.logger.error('BOOTSTRAP', `初始化 rewards context 失败: ${error.message}`)
+            this.logger.error('BOOTSTRAP', `初始化 rewards context 失败: ${formatError(error)}`)
             throw error
+        } finally {
+            // 上游 241b82b：浏览器请求会刷新 cookie，后续 HTTP 必须使用同一端最新缓存。
+            try {
+                const freshCookies = await page.context().cookies()
+                if (isMobile) this.bot.cookies = freshCookies
+                else this.bot.desktopCookies = freshCookies
+                this.logger.debug('BOOTSTRAP', `会话缓存已同步 | isMobile=${isMobile} | cookies=${freshCookies.length}`)
+            } catch (error) {
+                this.logger.debug('BOOTSTRAP', `会话缓存同步失败: ${formatError(error)}`)
+            }
         }
     }
 
@@ -2266,87 +2370,95 @@ class RewardsManager {
      */
     async _resolveActionIds(page, htmls) {
         const result = {}
+        // 单层动态发现；最多 128 个 chunk，不递归扫描资源图。
+        const MAX_CHUNKS = 128
         try {
             const initialChunks = new Set()
-            const chunkRegex = /(?:\/_next\/)?(static\/chunks\/[\w\-./()]+?\.js)/g
+            const chunkRegex = /(?:\/_next\/)?(static\/(?:chunks|immutable|media)\/[\w\-./()]+?\.js)/g
             for (const html of htmls) {
-                if (!html) continue
+                if (typeof html !== 'string') continue
                 for (const match of html.matchAll(chunkRegex)) {
                     initialChunks.add('/_next/' + match[1])
+                    if (initialChunks.size >= MAX_CHUNKS) break
                 }
+                if (initialChunks.size >= MAX_CHUNKS) break
             }
-
-            if (initialChunks.size === 0) {
-                this.logger.warn('BOOTSTRAP', 'HTML 中未发现初始 chunks')
-            }
-
-            this.logger.debug('BOOTSTRAP', `获取 ${initialChunks.size} 个初始 JS chunks`)
+            if (!initialChunks.size) this.logger.warn('BOOTSTRAP', 'HTML 中未发现初始 chunks')
             const jsByPath = await this._fetchJsChunks(page, [...initialChunks])
-
-            // 动态导入的 chunks
-            const dynamicPaths = []
-            for (const js of jsByPath.values()) {
-                for (const p of this._extractDynamicChunkPaths(js)) {
-                    if (!jsByPath.has(p) && !dynamicPaths.includes(p)) {
-                        dynamicPaths.push(p)
+            const dynamicPaths = new Set()
+            const remaining = MAX_CHUNKS - initialChunks.size
+            if (remaining > 0) {
+                outer: for (const js of jsByPath.values()) {
+                    for (const p of this._extractDynamicChunkPaths(js)) {
+                        if (!initialChunks.has(p)) dynamicPaths.add(p)
+                        if (dynamicPaths.size >= remaining) break outer
                     }
                 }
             }
-            if (dynamicPaths.length) {
-                this.logger.debug('BOOTSTRAP', `获取 ${dynamicPaths.length} 个动态 chunks`)
-                const moreJs = await this._fetchJsChunks(page, dynamicPaths)
+            if (dynamicPaths.size) {
+                const moreJs = await this._fetchJsChunks(page, [...dynamicPaths])
                 for (const [p, js] of moreJs) jsByPath.set(p, js)
             }
-
-            for (const [path, js] of jsByPath) {
-                const filename = path.split('/').pop() ?? path
+            for (const js of jsByPath.values()) {
                 const ids = this.bot.reactParser.extractActionIds(js)
-                const names = Object.keys(ids.byName)
-                if (names.length) {
-                    Object.assign(result, ids.byName)
-                    this.logger.debug('BOOTSTRAP', `在 ${filename} 中发现 ${names.length} 个 action id: [${names.join(', ')}]`)
-                }
+                Object.assign(result, ids.byName)
             }
-            this.logger.debug('BOOTSTRAP', `共发现 ${Object.keys(result).length} 个 action ids: [${Object.keys(result).join(', ')}]`)
+            this.logger.debug('BOOTSTRAP', `共解析 ${jsByPath.size} 个 chunks | actions=${Object.keys(result).length}`)
         } catch (error) {
-            this.logger.error('BOOTSTRAP', `解析 action ids 失败: ${error.message}`)
+            this.logger.error('BOOTSTRAP', `解析 action ids 失败: ${formatError(error)}`)
         }
         return result
     }
 
     async _fetchJsChunks(page, paths) {
         const result = new Map()
-        await Promise.all(paths.map(async (p) => {
-            try {
-                const res = await page.request.get(URLS.rewards.path(p))
-                if (res.ok()) result.set(p, await res.text())
-            } catch (error) {
-                this.logger.debug('BOOTSTRAP', `Chunk 获取失败 | path=${p} | ${error.message}`)
+        const allowed = [...new Set(paths)].filter(p => typeof p === 'string' &&
+            /^\/_next\/static\/(?:chunks|immutable|media)\/[\w./()-]+\.js$/.test(p) &&
+            !p.split('/').includes('..')).slice(0, 128)
+        const MAX_BYTES = 2 * 1024 * 1024
+        let cursor = 0
+        const worker = async () => {
+            while (cursor < allowed.length) {
+                const p = allowed[cursor++]
+                try {
+                    const res = await page.request.get(URLS.rewards.path(p), { timeout: 15000 })
+                    if (!res.ok()) continue
+                    const headers = typeof res.headers === 'function' ? res.headers() : {}
+                    if (Number(headers['content-length']) > MAX_BYTES) continue
+                    const js = await res.text()
+                    if (typeof js === 'string' && Buffer.byteLength(js, 'utf8') <= MAX_BYTES) result.set(p, js)
+                } catch (error) {
+                    this.logger.debug('BOOTSTRAP', `Chunk 获取失败: ${formatError(error)}`)
+                }
             }
-        }))
+        }
+        await Promise.all(Array.from({ length: Math.min(4, allowed.length) }, worker))
         return result
     }
 
     _extractDynamicChunkPaths(js) {
         const seen = new Set()
+        const MAX_PATHS = 128
+        const add = p => {
+            if (seen.size < MAX_PATHS && /^\/_next\/static\/(?:chunks|immutable|media)\/[\w./()-]+\.js$/.test(p) &&
+                !p.split('/').includes('..')) seen.add(p)
+        }
         const builder = /static\/chunks\/"\s*\+\s*\w+\s*\+\s*"([-.])"\s*\+\s*\{([\s\S]*?)\}\s*\[/g
         for (const m of js.matchAll(builder)) {
-            const sep = m[1]
-            const body = m[2]
-            const entryRe = /"([\w$-]+)":\s*"([^"]+)"/g
-            for (const e of body.matchAll(entryRe)) {
-                const path = `/_next/static/chunks/${e[2]}${sep}${e[1]}.js`
-                seen.add(path)
+            for (const e of m[2].matchAll(/"([\w$-]+)":\s*"([^"]+)"/g)) {
+                add(`/_next/static/chunks/${e[2]}${m[1]}${e[1]}.js`)
+                if (seen.size >= MAX_PATHS) return [...seen]
             }
         }
-        // Script-4：如果 builder 正则未匹配，全局扫描 id:hash 对作为 fallback
-        // 这可以发现 builder 形状变化后的动态 chunks（如 streak protection action 所在 chunk）
-        if (!seen.size) {
-            const idHashRe = /\b(\d{2,6}):"([a-f0-9]{12,})"/g
-            for (const m of js.matchAll(idHashRe)) {
-                seen.add(`/_next/static/chunks/${m[1]}-${m[2]}.js`)
-                seen.add(`/_next/static/chunks/${m[1]}.${m[2]}.js`)
-            }
+        // 上游 bf9466ab：Webpack fallback 与 Turbopack 字面路径均需扫描。
+        for (const m of js.matchAll(/\b(\d{2,6}):"([a-f0-9]{12,})"/g)) {
+            add(`/_next/static/chunks/${m[1]}-${m[2]}.js`)
+            add(`/_next/static/chunks/${m[1]}.${m[2]}.js`)
+            if (seen.size >= MAX_PATHS) return [...seen]
+        }
+        for (const m of js.matchAll(/"(static\/(?:immutable|chunks|media)\/[\w\-./()]+?\.js)"/g)) {
+            add(`/_next/${m[1]}`)
+            if (seen.size >= MAX_PATHS) break
         }
         return [...seen]
     }
@@ -2377,13 +2489,17 @@ class RewardsManager {
                 Accept: 'text/x-component',
                 'Content-Type': 'text/plain;charset=UTF-8',
                 'Next-Action': actionId,
-                'Next-Router-State-Tree': routerStateTree
+                'Next-Router-State-Tree': routerStateTree,
+                ...(this.bot.rewardsDeploymentId ? { 'X-Deployment-Id': this.bot.rewardsDeploymentId } : {})
             },
             data: JSON.stringify(body)
         })
 
         const acknowledged = this._serverActionAcknowledged(response.data)
-        return { status: response.status, acknowledged }
+        const normalized = typeof response.data === 'string' ? response.data.replace(/\\"/g, '"') : ''
+        const matches = [...normalized.matchAll(/"availablePoints"\s*:\s*(\d+)/g)]
+        const availablePoints = matches.length ? pointValue(matches.at(-1)[1]) : null
+        return { status: response.status, acknowledged, availablePoints }
     }
 
     _serverActionAcknowledged(response) {
@@ -2394,30 +2510,38 @@ class RewardsManager {
     /**
      * 获取搜索积分计数器
      */
+
     async getSearchPoints() {
-        try {
-            const data = await this.getDashboardData()
-            return data?.userStatus?.counters ?? {}
-        } catch (error) {
-            this.logger.warn('DASHBOARD', `获取搜索积分失败，使用缓存值: ${error.message}`)
-            return this._dashboardCache?.userStatus?.counters ?? {}
-        }
+        const data = await this.getDashboardData({ fresh: true, allowStale: false })
+        if (!data?.userStatus?.counters || typeof data.userStatus.counters !== 'object') throw new Error('面板未提供搜索计数')
+        return data.userStatus.counters
     }
 
-    /**
-     * 计算缺失的搜索积分
-     */
     missingSearchPoints(counters, isMobile) {
-        const mobileData = counters.mobileSearch?.[0]
-        const desktopData = counters.pcSearch?.[0]
-        const edgeData = counters.pcSearch?.[1]
-
-        const mobilePoints = mobileData ? Math.max(0, mobileData.pointProgressMax - mobileData.pointProgress) : 0
-        const desktopPoints = desktopData ? Math.max(0, desktopData.pointProgressMax - desktopData.pointProgress) : 0
-        const edgePoints = edgeData ? Math.max(0, edgeData.pointProgressMax - edgeData.pointProgress) : 0
-        const totalPoints = isMobile ? mobilePoints : desktopPoints + edgePoints
-
-        return { mobilePoints, desktopPoints, edgePoints, totalPoints }
+        const mobile = counters?.mobileSearch ?? counters?.MobileSearch
+        const pc = counters?.pcSearch ?? counters?.PCSearch
+        const isEdge = item => [item?.offerId, item?.name, item?.title, item?.promotionSubtype]
+            .some(value => typeof value === 'string' && /(^|[_\s-])edge([_\s-]|$)/i.test(value))
+        const summarize = items => {
+            if (!Array.isArray(items)) return { known: false, max: 0, earned: 0, remaining: 0 }
+            let max = 0, earned = 0
+            for (const item of items) {
+                const ceiling = pointValue(item?.pointProgressMax)
+                const progress = pointValue(item?.pointProgress)
+                if (ceiling === null || progress === null) return { known: false, max: 0, earned: 0, remaining: 0 }
+                max += ceiling
+                earned += Math.min(ceiling, progress)
+            }
+            return { known: true, max, earned, remaining: max - earned }
+        }
+        const mobileQuota = summarize(mobile)
+        const desktopQuota = summarize(Array.isArray(pc) ? pc.filter(item => !isEdge(item)) : pc)
+        const edgeQuota = summarize(Array.isArray(pc) ? pc.filter(isEdge) : pc)
+        const known = isMobile ? mobileQuota.known : desktopQuota.known && edgeQuota.known
+        const max = isMobile ? mobileQuota.max : desktopQuota.max + edgeQuota.max
+        const totalPoints = isMobile ? mobileQuota.remaining : desktopQuota.remaining + edgeQuota.remaining
+        return { mobilePoints: mobileQuota.remaining, desktopPoints: desktopQuota.remaining, edgePoints: edgeQuota.remaining,
+            totalPoints, known, max, state: !known ? 'unknown' : max === 0 ? 'unavailable' : totalPoints === 0 ? 'complete' : 'available' }
     }
 
     /**
@@ -2449,7 +2573,7 @@ class RewardsManager {
             })
             this.logger.info('STREAK', '连续登录保护已启用')
         } catch (error) {
-            this.logger.error('STREAK', `启用连续登录保护失败: ${error.message}`)
+            this.logger.error('STREAK', `启用连续登录保护失败: ${formatError(error)}`)
         }
     }
 
@@ -2457,18 +2581,26 @@ class RewardsManager {
      * 完成每日任务集
      */
     async doDailySet(data, page, isMobile = true) {
+        if (!data.dailySetPromotions || typeof data.dailySetPromotions !== 'object') {
+            this.logger.warn('DAILY-SET', '面板未提供每日任务数据，不能判定完成')
+            return { status: 'unknown' }
+        }
         const todayKey = getFormattedDate()
         const todayData = data.dailySetPromotions?.[todayKey]
+        if (!Array.isArray(todayData)) {
+            this.logger.warn('DAILY-SET', '面板未提供当天任务列表，状态未知')
+            return { status: 'unknown' }
+        }
         const activities = (todayData || []).filter(x => !x?.complete && x.pointProgressMax > 0)
 
         if (!activities.length) {
-            this.logger.info('DAILY-SET', '所有"每日任务"已完成')
+            this.logger.info('DAILY-SET', todayData.length && todayData.every(item => item?.complete === true) ? '当天每日任务均已确认完成' : '当前没有可自动处理的每日任务')
             return
         }
 
         this.logger.info('DAILY-SET', `开始处理 ${activities.length} 个"每日任务"`)
-        await this._solveActivities(activities, page, isMobile)
-        this.logger.success('DAILY-SET', '"每日任务"全部完成')
+        const results = await this._solveActivities(activities, page, isMobile)
+        return this._summarizeActivities('DAILY-SET', '每日任务', results)
     }
 
     /**
@@ -2481,7 +2613,7 @@ class RewardsManager {
             this._dashboardCache = null // 清除缓存，强制重新获取
             freshData = await this.getDashboardData()
         } catch (e) {
-            this.logger.warn('MORE-PROMOTIONS', `刷新仪表盘数据失败，使用初始数据: ${e.message}`)
+            this.logger.warn('MORE-PROMOTIONS', `刷新仪表盘数据失败，使用初始数据: ${formatError(e)}`)
         }
 
         // 合并 morePromotions 和 morePromotionsWithoutPromotionalItems，去重
@@ -2522,13 +2654,13 @@ class RewardsManager {
         }
 
         if (!activities.length) {
-            this.logger.info('MORE-PROMOTIONS', '所有"更多促销"已完成')
+            this.logger.info('MORE-PROMOTIONS', '当前没有可自动处理的更多促销，锁定或需手动项目保留')
             return
         }
 
         this.logger.info('MORE-PROMOTIONS', `开始处理 ${activities.length} 个"更多促销"`)
-        await this._solveActivities(activities, page, isMobile)
-        this.logger.success('MORE-PROMOTIONS', '"更多促销"全部完成')
+        const results = await this._solveActivities(activities, page, isMobile)
+        return this._summarizeActivities('MORE-PROMOTIONS', '更多促销', results)
     }
 
     /**
@@ -2573,10 +2705,34 @@ class RewardsManager {
     /**
      * 完成其他促销活动（通过 DAPI API）
      */
+    _inspectDapiResponse(response, oldBalance, requireBalance = true) {
+        const result = { status: 'unconfirmed', gainedPoints: 0, newBalance: null, reason: '' }
+        const httpStatus = response?.status
+        if (httpStatus !== undefined && (!Number.isInteger(httpStatus) || httpStatus < 200 || httpStatus >= 300)) {
+            return { ...result, status: 'failed', reason: 'HTTP 响应未成功' }
+        }
+        const rawCode = response?.data?.code
+        const code = ['number', 'string'].includes(typeof rawCode) &&
+            (typeof rawCode !== 'string' || /^-?\d+(?:\.0+)?$/.test(rawCode.trim())) ? Number(rawCode) : NaN
+        if (!Number.isSafeInteger(code)) return { ...result, reason: '响应缺少有效的 API 代码' }
+        if (code !== 0) return { ...result, status: 'failed', reason: `API 代码 ${code}` }
+        if (!requireBalance) return { ...result, status: 'acknowledged' }
+
+        const newBalance = pointValue(response?.data?.response?.balance)
+        const baseline = pointValue(oldBalance)
+        if (newBalance === null) return { ...result, reason: '响应缺少有效的积分余额' }
+        result.newBalance = newBalance
+        if (baseline === null) return { ...result, reason: '提交前积分余额无效' }
+        const gained = newBalance - baseline
+        if (gained > 0) return { ...result, status: 'credited', gainedPoints: gained }
+        return { ...result, reason: `未确认到账，积分变化: ${gained}` }
+    }
+
     async doOtherPromotions() {
+        const result = { credited: 0, unconfirmed: 0, failed: 0, gainedPoints: 0 }
         if (!this.bot.accessToken) {
             this.logger.warn('OTHER-PROMOTIONS', '跳过：应用访问令牌不可用，此活动需要它！')
-            return
+            return { ...result, status: 'skipped' }
         }
 
         try {
@@ -2585,26 +2741,41 @@ class RewardsManager {
                 method: 'GET',
                 headers: this._buildDapiHeaders(false, false)
             })
-
-            if (response.data.code != 0) {
-                this.logger.warn('OTHER-PROMOTIONS', `API 返回非零代码: ${response.data.code}`)
-                return
+            const listing = this._inspectDapiResponse(response, null, false)
+            if (listing.status !== 'acknowledged') {
+                const level = listing.status === 'failed' ? 'error' : 'warn'
+                this.logger[level]('OTHER-PROMOTIONS', `活动列表未确认 | ${listing.reason}`)
+                result[listing.status === 'failed' ? 'failed' : 'unconfirmed']++
+                return { ...result, status: listing.status }
+            }
+            const promotions = response?.data?.response?.promotions
+            if (!Array.isArray(promotions)) {
+                this.logger.warn('OTHER-PROMOTIONS', 'API 未提供有效活动列表，不能判定活动已完成')
+                return { ...result, unconfirmed: 1, status: 'unconfirmed' }
             }
 
-            // 使用 UTC+8 时区的今天日期
+            // 沿用原有时区及活动筛选，只处理明确未完成且具有有效标识的 urlreward。
             const nowCST = new Date(Date.now() + 8 * 60 * 60 * 1000)
             const today = new Date(Date.UTC(nowCST.getUTCFullYear(), nowCST.getUTCMonth(), nowCST.getUTCDate()))
+            const activities = promotions.filter(x => {
+                const attributes = x?.attributes
+                if (!attributes || typeof attributes !== 'object') {
+                    result.unconfirmed++
+                    return false
+                }
+                if (attributes.type !== 'urlreward') return false
+                if (String(attributes.State || '').toLowerCase() === 'locked') return false
+                if (String(attributes.hidden).toLowerCase() === 'true') return false
+                const complete = String(attributes.complete).toLowerCase()
+                if (complete === 'true') return false
+                const max = pointValue(attributes.max)
+                if (max === 0) return false
+                if (complete !== 'false' || max === null || typeof attributes.offerid !== 'string' || !attributes.offerid.trim()) {
+                    result.unconfirmed++
+                    return false
+                }
 
-            const activities = (response.data.response?.promotions || []).filter(x => {
-                if (x.attributes.complete == 'True') return false
-                if (x.attributes.max <= 0) return false
-                if (x.attributes.State == 'locked') return false
-                if (!x.attributes.type) return false
-                if (x.attributes.hidden == 'True') return false
-                if (x.attributes.type != 'urlreward') return false
-
-                // 过滤掉未来的 daily_set_date 活动
-                const dailySetDate = x.attributes.daily_set_date
+                const dailySetDate = attributes.daily_set_date
                 if (typeof dailySetDate === 'string') {
                     const [monthValue, dayValue, yearValue] = dailySetDate.split('/')
                     const month = Number(monthValue)
@@ -2617,52 +2788,52 @@ class RewardsManager {
                 }
                 return true
             })
-
+            if (result.unconfirmed) this.logger.warn('OTHER-PROMOTIONS', `有 ${result.unconfirmed} 条活动缺少明确状态或有效字段，保留待确认`)
             if (!activities.length) {
-                this.logger.info('OTHER-PROMOTIONS', '所有"其他促销"已完成')
-                return
+                this.logger.info('OTHER-PROMOTIONS', '没有可自动处理的"其他促销"')
+                return result
             }
-
             this.logger.info('OTHER-PROMOTIONS', `开始处理 ${activities.length} 个"其他促销"`)
 
-            let oldBalance = this.bot.currentPoints
-            let totalGained = 0
-
             for (const activity of activities) {
+                let requestCompleted = false
                 try {
                     const offerId = activity.attributes.offerid
+                    const oldBalance = this.bot.currentPoints
                     this.logger.info('OTHER-PROMOTIONS', `处理活动: ${offerId}`)
-
                     const jsonData = this._buildDapiActivityBody(101, { offerid: offerId })
-
                     const resp = await this.bot.httpClient.request({
                         url: 'https://prod.rewardsplatform.microsoft.com/dapi/me/activities',
                         method: 'POST',
                         headers: this._buildDapiHeaders(),
                         data: JSON.stringify(jsonData)
                     })
-
-                    const newBalance = Number(resp?.data?.response?.balance ?? oldBalance)
-                    const gained = newBalance - oldBalance
-
-                    if (gained > 0) {
-                        totalGained += gained
-                        this.bot.currentPoints = newBalance
-                        this.bot.gainedPoints += gained
-                        this.logger.success('OTHER-PROMOTIONS', `完成活动 ${offerId} | +${gained} 积分`)
+                    requestCompleted = true
+                    const observed = this._inspectDapiResponse(resp, oldBalance)
+                    if (observed.newBalance !== null && observed.status !== 'failed') this.bot.currentPoints = observed.newBalance
+                    if (observed.status === 'credited') {
+                        result.credited++
+                        result.gainedPoints += observed.gainedPoints
+                        this.bot.gainedPoints += observed.gainedPoints
+                        this.logger.success('OTHER-PROMOTIONS', `活动 ${offerId} 已到账 | +${observed.gainedPoints} 积分`)
                     } else {
-                        this.logger.warn('OTHER-PROMOTIONS', `活动 ${offerId} 未获得积分`)
+                        result[observed.status === 'failed' ? 'failed' : 'unconfirmed']++
+                        const level = observed.status === 'failed' ? 'error' : 'warn'
+                        this.logger[level]('OTHER-PROMOTIONS', `活动 ${offerId} ${observed.status === 'failed' ? '失败' : '未确认'} | ${observed.reason}`)
                     }
-                    oldBalance = newBalance
-                    await wait(randomDelay(5000, 15000))
                 } catch (error) {
-                    this.logger.error('OTHER-PROMOTIONS', `处理活动失败: ${error.message}`)
+                    result.failed++
+                    this.logger.error('OTHER-PROMOTIONS', `处理活动失败: ${formatError(error)}`)
+                } finally {
+                    if (requestCompleted) await wait(randomDelay(5000, 15000))
                 }
             }
-
-            this.logger.info('OTHER-PROMOTIONS', `"其他促销"完成 | 总计 +${totalGained} 积分`)
+            this.logger.info('OTHER-PROMOTIONS', `"其他促销"处理结束 | 已到账: ${result.credited} | 未确认: ${result.unconfirmed} | 失败: ${result.failed} | +${result.gainedPoints} 积分`)
+            return result
         } catch (error) {
-            this.logger.warn('OTHER-PROMOTIONS', `API 调用失败: ${error.message}`)
+            result.failed++
+            this.logger.error('OTHER-PROMOTIONS', `API 调用失败: ${formatError(error)}`)
+            return { ...result, status: 'failed' }
         }
     }
 
@@ -2673,234 +2844,205 @@ class RewardsManager {
     async doDailyCheckIn() {
         if (!this.bot.accessToken) {
             this.logger.warn('CHECK-IN', '跳过：应用访问令牌不可用')
-            return
+            return { status: 'skipped', gainedPoints: 0 }
         }
 
-        const oldBalance = Number(this.bot.currentPoints ?? 0)
-        this.logger.info('CHECK-IN', `开始每日签到 | 当前积分: ${oldBalance}`)
-
+        const oldBalance = pointValue(this.bot.currentPoints)
+        this.logger.info('CHECK-IN', `开始每日签到 | 当前积分: ${oldBalance === null ? '未确认' : oldBalance}`)
         try {
-            // Script-4：直接使用 type 103（移除 101 fallback）
-            const gained = await this._submitDailyCheckIn(103, oldBalance)
-            if (gained > 0) {
-                this.logger.success('CHECK-IN', `每日签到完成 (type=103) | +${gained} 积分`)
+            // 保留原有 type 103，一次提交，不回退或重放。
+            const result = await this._submitDailyCheckIn(103, oldBalance)
+            if (result.status === 'credited') {
+                this.logger.success('CHECK-IN', `每日签到积分已到账 (type=103) | +${result.gainedPoints} 积分`)
+            } else if (result.status === 'failed') {
+                this.logger.error('CHECK-IN', `每日签到失败 | ${result.reason}`)
             } else {
-                // Script-4 行为一致：签到 API 成功但 balance 未变，通常因今日已签到过
-                // 此为正常情况而非错误，降级为 INFO 避免误报
-                this.logger.info('CHECK-IN', '每日签到完成但未获得积分（可能今日已签到过）')
+                this.logger.warn('CHECK-IN', `每日签到结果未确认 | ${result.reason}；不据此判断今日已签到`)
             }
+            return result
         } catch (error) {
-            this.logger.error('CHECK-IN', `每日签到失败: ${error.message}`)
+            this.logger.error('CHECK-IN', `每日签到请求失败，结果未确认且不重放: ${formatError(error)}`)
+            return { status: 'failed', gainedPoints: 0, reason: '请求未取得有效响应' }
         }
     }
 
     /**
-     * 提交每日签到请求
-     * Script-4 变化：使用专用 UA（iPad Safari + BingSapphire 33.x）、AppId 升级、X-Rewards-IsMobile='true'
+     * 提交每日签到请求，保留专用 UA、AppId 和 type 103。
      */
     async _submitDailyCheckIn(type, oldBalance) {
-        try {
-            const jsonData = this._buildDapiActivityBody(type)
-
-            // Script-4：使用每日签到专用请求头（UA 和 AppId 升级）
-            const headers = {
-                Authorization: `Bearer ${this.bot.accessToken}`,
-                'User-Agent': DAILY_CHECKIN_USER_AGENT,
-                'Content-Type': 'application/json',
-                'X-Rewards-Country': this.bot.geoLocale,
-                'X-Rewards-Language': 'zh',
-                'X-Rewards-IsMobile': 'true',
-                'X-Rewards-AppId': DAILY_CHECKIN_APP_ID,
-                'X-Rewards-PartnerId': 'startapp',
-                'X-Rewards-Flights': 'rwgobig',
-                'Accept': '*/*'
-            }
-
-            const response = await this.bot.httpClient.request({
-                url: URLS.platform.activities,
-                method: 'POST',
-                headers: headers,
-                data: JSON.stringify(jsonData)
-            })
-
-            const newBalance = Number(response?.data?.response?.balance ?? oldBalance)
-            const gained = newBalance - oldBalance
-            if (gained > 0) {
-                this.bot.currentPoints = newBalance
-                this.bot.gainedPoints += gained
-            }
-            return gained
-        } catch (error) {
-            this.logger.error('CHECK-IN', `提交签到 (type=${type}) 失败: ${error.message}`)
-            return 0
+        const jsonData = this._buildDapiActivityBody(type)
+        const headers = {
+            Authorization: `Bearer ${this.bot.accessToken}`,
+            'User-Agent': DAILY_CHECKIN_USER_AGENT,
+            'Content-Type': 'application/json',
+            'X-Rewards-Country': this.bot.geoLocale,
+            'X-Rewards-Language': 'zh',
+            'X-Rewards-IsMobile': 'true',
+            'X-Rewards-AppId': DAILY_CHECKIN_APP_ID,
+            'X-Rewards-PartnerId': 'startapp',
+            'X-Rewards-Flights': 'rwgobig',
+            'Accept': '*/*'
         }
+        const response = await this.bot.httpClient.request({
+            url: URLS.platform.activities,
+            method: 'POST',
+            headers: headers,
+            data: JSON.stringify(jsonData)
+        })
+        const result = this._inspectDapiResponse(response, oldBalance)
+        if (result.newBalance !== null && result.status !== 'failed') this.bot.currentPoints = result.newBalance
+        if (result.status === 'credited') this.bot.gainedPoints += result.gainedPoints
+        return result
     }
 
     /**
      * 领取奖励积分
      */
+
     async doClaimBonusPoints(data) {
-        const pointsActivity = data.pointClaimBannerPromotion
-        if (!pointsActivity) {
-            this.logger.info('CLAIM-BONUS-POINTS', '未找到奖励积分横幅')
-            return
-        }
-        if (pointsActivity.complete) {
-            this.logger.info('CLAIM-BONUS-POINTS', `奖励积分已领取 | offerId=${pointsActivity.offerId}`)
-            return
-        }
-
-        // Script-4：使用动态发现的 reportClaimAllPoints action id
-        const actionId = this.bot.nextActions.reportClaimAllPoints
-        if (!actionId) {
-            this.logger.warn('CLAIM-BONUS-POINTS', '跳过：未发现 "reportClaimAllPoints" action id')
-            return
-        }
-
-        const oldBalance = Number(this.bot.currentPoints ?? 0)
-        this.logger.info('CLAIM-BONUS-POINTS', `开始领取奖励积分 | geo=${this.bot.geoLocale} | oldBalance=${oldBalance}`)
-
         try {
-            // Script-4：调用 Server Action（body 为空数组）
-            const { status, acknowledged } = await this.reportServerAction(actionId, [])
-
-            const newBalance = await this.getCurrentPoints()
-            const gainedPoints = newBalance - oldBalance
-
-            this.logger.debug('CLAIM-BONUS-POINTS', `响应 | status=${status} | acknowledged=${acknowledged} | oldBalance=${oldBalance} | newBalance=${newBalance} | gainedPoints=${gainedPoints}`)
-
-            if (acknowledged) {
-                if (gainedPoints > 0) {
-                    this.bot.currentPoints = newBalance
-                    this.bot.gainedPoints += gainedPoints
-                }
-                this.logger.info('CLAIM-BONUS-POINTS', `领取完成 | acknowledged=true${gainedPoints > 0 ? ` | +${gainedPoints} 积分` : ''} | newBalance=${newBalance}`)
-            } else {
-                this.logger.info('CLAIM-BONUS-POINTS', `无可领取积分 | status=${status} | 余额不变: ${newBalance}`)
+            const before = await this.getDashboardData({ fresh: true, allowStale: false })
+            const activity = before.pointClaimBannerPromotion
+            if (!activity) {
+                this.logger.info('CLAIM-BONUS-POINTS', '当前没有奖励积分横幅')
+                return { status: 'skipped' }
             }
-
-            await wait(randomDelay(5000, 10000))
+            if (activity.complete === true) {
+                this.logger.info('CLAIM-BONUS-POINTS', '奖励积分已领取（新鲜面板确认）')
+                return { status: 'completed' }
+            }
+            const actionId = this.bot.nextActions.reportClaimAllPoints
+            if (!actionId) {
+                this.logger.warn('CLAIM-BONUS-POINTS', '跳过：未发现 reportClaimAllPoints action id')
+                return { status: 'skipped' }
+            }
+            if (this._claimSubmitted) {
+                this.logger.warn('CLAIM-BONUS-POINTS', '本轮已提交过领取请求，保留待确认')
+                return { status: 'submitted' }
+            }
+            const oldBalance = this._readDashboardBalance(before)
+            if (oldBalance === null) throw new Error('领取前余额缺失')
+            this._claimSubmitted = true
+            let response
+            try {
+                response = await this.reportServerAction(actionId, [], {}, this._activeIsMobile !== false)
+            } catch (error) {
+                this.logger.warn('CLAIM-BONUS-POINTS', `提交结果不明，仅回读状态且不重放 | ${formatError(error)}`)
+            }
+            const after = await this.getDashboardData({ fresh: true, allowStale: false })
+            const balance = this._readDashboardBalance(after)
+            if (balance === null) throw new Error('领取后余额未确认')
+            this.bot.currentPoints = balance
+            const gained = Math.max(0, balance - oldBalance)
+            this.bot.gainedPoints += gained
+            const confirmed = after.pointClaimBannerPromotion?.complete === true
+            this.logger[confirmed ? 'info' : 'warn']('CLAIM-BONUS-POINTS', `领取状态=${confirmed ? '已确认' : '待确认'} | acknowledged=${response?.acknowledged ?? 'unknown'} | 账户余额变化=+${gained}`)
+            return { status: confirmed ? 'completed' : 'submitted', gainedPoints: gained }
         } catch (error) {
-            this.logger.error('CLAIM-BONUS-POINTS', `领取奖励积分失败: ${error.message}`)
+            this.logger.error('CLAIM-BONUS-POINTS', `领取结果未确认 | ${formatError(error)}`)
+            return { status: 'failed' }
         }
     }
 
     /**
      * 解决活动列表（URL 奖励类型）
      */
+
     async _solveActivities(activities, page, isMobile = true) {
+        const results = []
         for (const activity of activities) {
             try {
-                const type = activity.promotionType?.toLowerCase() || ''
-                const offerId = activity.offerId
-                this.logger.debug('ACTIVITY', `处理活动: ${activity.title} | type=${type} | offerId=${offerId}`)
-
-                if (type === 'urlreward') {
-                    await this._doUrlReward(activity, page, isMobile)
-                } else if (type === 'quiz') {
-                    this.logger.info('ACTIVITY', `测验活动（需浏览器交互）: ${activity.title}`)
-                    // 测验活动需要复杂的浏览器交互，这里通过 URL 访问触发
-                    if (activity.destinationUrl && page) {
-                        await page.goto(activity.destinationUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
-                        await wait(5000)
-                    }
-                } else {
-                    this.logger.warn('ACTIVITY', `不支持的活动类型: ${type} | ${activity.title}`)
+                const type = String(activity.promotionType || '').toLowerCase()
+                if (type === 'urlreward') results.push(await this._doUrlReward(activity, page, isMobile))
+                else {
+                    results.push({ status: 'manual', offerId: activity.offerId })
+                    this.logger.info('ACTIVITY', `需实际交互的任务保留待处理 | type=${type || 'unknown'} | ${activity.title || activity.offerId}`)
                 }
                 await wait(randomDelay(3000, 8000))
             } catch (error) {
-                this.logger.error('ACTIVITY', `处理活动失败: ${error.message}`)
+                results.push({ status: 'failed', offerId: activity.offerId })
+                this.logger.error('ACTIVITY', `任务处理失败 | ${formatError(error)}`)
             }
         }
+        return results
     }
 
-    /**
-     * 完成 URL 奖励活动（Script-4 方案：基于 Server Action + reactSnapshot）
-     * 移植自 Script-4 UrlReward.ts
-     * @param {object} promotion 活动对象
-     * @param {object} page 浏览器页面（保留兼容，Server Action 方案不直接使用）
-     * @param {boolean} isMobile 是否移动端（决定 cookies 和指纹头）
-     */
+    _summarizeActivities(tag, title, results) {
+        const count = status => results.filter(item => item?.status === status).length
+        const completed = count('completed')
+        const manual = count('manual') + count('skipped')
+        const failed = count('failed')
+        const pending = results.length - completed - manual - failed
+        const message = `${title}处理结束 | 已确认=${completed} | 待确认=${pending} | 待处理/跳过=${manual} | 失败=${failed}`
+        if (pending || failed) this.logger.warn(tag, message)
+        else this.logger.info(tag, message)
+        return { completed, manual, failed, pending }
+    }
+
+    async _refreshOffers(page) {
+        if (!page?.request) return null
+        const htmls = []
+        for (const url of [URLS.rewards.earn, URLS.rewards.dashboard]) {
+            try {
+                const response = await page.request.get(url, { timeout: 20000 })
+                if (response.ok()) htmls.push(await response.text())
+            } catch (error) { this.logger.debug('ACTIVITY', `状态回读失败 | ${formatError(error)}`) }
+        }
+        try {
+            const cookies = await page.context().cookies()
+            if (this._activeIsMobile === false) this.bot.desktopCookies = cookies
+            else this.bot.cookies = cookies
+        } catch {}
+        if (!htmls.length) return null
+        const snapshot = this.bot.reactParser.snapshotPage(htmls.join('\n'))
+        if (!snapshot?.offers?.length) return null
+        this.bot.reactSnapshot = snapshot
+        return snapshot
+    }
+
     async _doUrlReward(promotion, page, isMobile = true) {
         const offerId = promotion.offerId
-
-        // Script-4：使用动态发现的 reportActivity action id
-        const actionId = this.bot.nextActions.reportActivity
-        if (!actionId) {
-            this.logger.warn('URL-REWARD', `跳过 ${offerId}: "reportActivity" action id 未发现`)
-            return
+        let live = this.bot.reactSnapshot?.offers?.find(item => item.offerId === offerId)
+        if (!live) live = (await this._refreshOffers(page))?.offers?.find(item => item.offerId === offerId)
+        if (live?.isCompleted || promotion.complete === true) return { status: 'completed', offerId }
+        if (!live?.reportable || !this.bot.nextActions.reportActivity) {
+            this.logger.info('URL-REWARD', `跳过不可执行的任务 | offerId=${offerId}`)
+            return { status: 'skipped', offerId }
         }
-
-        // Script-4：从 reactSnapshot 中查找实时 hash
-        const live = this.bot.reactSnapshot?.offers.find(o => o.offerId === offerId)
-        if (!live) {
-            this.logger.warn('URL-REWARD', `跳过 ${offerId}: 页面快照中未找到此活动`)
-            return
+        if (this.bot.config.workers?.skipNonPointTasks && this._isNonCrediting(live.points, live.promotionSubtype, live.title)) return { status: 'skipped', offerId }
+        this._submittedUrlOffers ??= new Set()
+        if (this._submittedUrlOffers.has(offerId)) {
+            this.logger.warn('URL-REWARD', `本轮已提交，保留待确认且不重复请求 | offerId=${offerId}`)
+            return { status: 'submitted', offerId }
         }
-        if (!live.reportable) {
-            this.logger.warn('URL-REWARD', `跳过 ${offerId}: 不可上报 (已完成/锁定/无hash/未来日期)`)
-            return
-        }
-
-        // skipNonPointTasks：跳过 0 积分活动
-        if (this.bot.config.workers?.skipNonPointTasks && this._isNonCrediting(live.points, live.promotionSubtype, live.title)) {
-            this.logger.info('URL-REWARD', `跳过 ${offerId}: 无积分活动 (points=${live.points})`)
-            return
-        }
-
-        const oldBalance = Number(this.bot.currentPoints ?? 0)
-        const expectedPoints = live.points
-        const activityType = Number(promotion.activityType ?? 11)
-
-        this.logger.info('URL-REWARD', `开始 UrlReward | offerId=${offerId} | geo=${this.bot.geoLocale} | oldBalance=${oldBalance}`)
-
+        const oldBalance = await this.getCurrentPoints({ fresh: true, required: true })
+        let response
         try {
-            // Script-4：调用 Server Action（而非 reportactivity API）
-            const { status, acknowledged } = await this.reportServerAction(
-                actionId,
-                [
-                    live.hash,
-                    activityType,
-                    {
-                        offerid: offerId,
-                        isPromotional: live.isPromotional ? true : '$undefined',
-                        timezoneOffset: this.bot.timezoneOffset
-                    }
-                ],
-                {},
-                isMobile
-            )
-
-            // Script-4 扩展：等待积分到账（Server Action 上报成功后积分可能有延迟）
-            await wait(randomDelay(3000, 5000))
-            let newBalance = await this.getCurrentPoints()
-            let gainedPoints = newBalance - oldBalance
-
-            // 如果第一次检查未获得积分，等待后重试一次（积分延迟到账的常见情况）
-            if (gainedPoints <= 0 && acknowledged && expectedPoints > 0) {
-                this.logger.debug('URL-REWARD', `首次检查未到账，等待重试 | offerId=${offerId} | acknowledged=${acknowledged}`)
-                await wait(randomDelay(5000, 8000))
-                newBalance = await this.getCurrentPoints()
-                gainedPoints = newBalance - oldBalance
-            }
-
-            this.logger.debug('URL-REWARD', `响应 | offerId=${offerId} | status=${status} | acknowledged=${acknowledged} | gainedPoints=${gainedPoints}`)
-
-            if (gainedPoints > 0) {
-                this.bot.currentPoints = newBalance
-                this.bot.gainedPoints += gainedPoints
-                const shortfall = expectedPoints > 0 && gainedPoints < expectedPoints
-                this.logger.success('URL-REWARD', `完成 UrlReward | offerId=${offerId} | +${gainedPoints}${expectedPoints > 0 ? `/${expectedPoints}` : ''} 积分${shortfall ? ' | 警告: 实际积分少于预期' : ''}`)
-            } else if (acknowledged && expectedPoints === 0) {
-                this.logger.info('URL-REWARD', `完成 UrlReward (无积分活动) | offerId=${offerId} | acknowledged=true`)
-            } else {
-                this.logger.warn('URL-REWARD', `UrlReward 未获得积分 | offerId=${offerId} | acknowledged=${acknowledged} | expected=${expectedPoints}`)
-            }
-
-            await wait(randomDelay(5000, 10000))
+            this._submittedUrlOffers.add(offerId)
+            response = await this.reportServerAction(this.bot.nextActions.reportActivity,
+                [live.hash, Number(live.activityType ?? promotion.activityType ?? 11), { offerid: offerId,
+                    isPromotional: live.isPromotional ? true : '$undefined', timezoneOffset: this.bot.timezoneOffset }],
+                { url: URLS.rewards.dashboard, referer: URLS.rewards.dashboard,
+                    routerStateTree: this.bot.reactParser.routerStateTree('dashboard') }, isMobile)
         } catch (error) {
-            this.logger.error('URL-REWARD', `doUrlReward 错误 | offerId=${offerId} | ${error.message}`)
+            const observed = (await this._refreshOffers(page))?.offers?.find(item => item.offerId === offerId)
+            const status = observed?.isCompleted ? 'completed' : 'submitted'
+            this.logger.warn('URL-REWARD', `请求结果不明，已回读状态且不重放提交 | offerId=${offerId} | ${formatError(error)}`)
+            return { status, offerId, acknowledged: false }
         }
+        let balance = pointValue(response.availablePoints)
+        if (balance === null) balance = await this.getCurrentPoints({ fresh: true, required: true })
+        this.bot.currentPoints = balance
+        const gained = Math.max(0, balance - oldBalance)
+        this.bot.gainedPoints += gained
+        await wait(1500)
+        const observed = (await this._refreshOffers(page))?.offers?.find(item => item.offerId === offerId)
+        const completed = observed?.isCompleted === true
+        const message = `offerId=${offerId} | acknowledged=${response.acknowledged} | 状态=${completed ? '已确认完成' : '待确认'} | 账户余额变化=+${gained}`
+        if (completed) this.logger.info('URL-REWARD', message)
+        else this.logger.warn('URL-REWARD', message)
+        await wait(randomDelay(5000, 10000))
+        return { status: completed ? 'completed' : 'submitted', offerId, acknowledged: response.acknowledged, gainedPoints: gained }
     }
 
     /**
@@ -2913,89 +3055,105 @@ class RewardsManager {
     }
 
     /**
-     * Read to Earn - 阅读文章赚积分（通过 App API）
-     * 每次阅读 +3 积分，最多 10 次 = +30 积分
+     * Read to Earn - 沿用原有活动请求，仅核验响应与实际余额变化。
+     * 到账次数不代表真实文章阅读数；无增长不能据此判断额度已满。
      */
     async doReadToEarn() {
+        const result = {
+            status: 'stopped', requests: 0, credited: 0, unconfirmed: 0, failed: 0,
+            gainedPoints: 0, startBalance: null, finalBalance: null, stopReason: '', reason: ''
+        }
         if (!this.bot.accessToken) {
             this.logger.warn('READ-TO-EARN', '跳过：应用访问令牌不可用，此活动需要它！')
-            return
+            return { ...result, status: 'skipped', stopReason: 'missing_token', reason: '应用访问令牌不可用' }
         }
 
-        const startBalance = Number(this.bot.currentPoints ?? 0)
+        const startBalance = pointValue(this.bot.currentPoints)
+        if (startBalance === null) {
+            this.logger.warn('READ-TO-EARN', '起始积分余额无效，停止处理；未发送活动请求')
+            return { ...result, status: 'unconfirmed', unconfirmed: 1, stopReason: 'invalid_start_balance', reason: '缺少有效的起始积分余额' }
+        }
+        result.startBalance = startBalance
+        result.finalBalance = startBalance
         const delayMin = this.bot.config.search.searchDelayMin || 30000
         const delayMax = this.bot.config.search.searchDelayMax || 60000
+        const requestLimit = 10
+        let oldBalance = startBalance
 
         this.logger.info('READ-TO-EARN', `开始 Read to Earn | 地区: ${this.bot.geoLocale} | 延迟: ${delayMin}-${delayMax}ms | 当前积分: ${startBalance}`)
 
-        try {
-            const articleCount = 10
-            let totalGained = 0
-            let articlesRead = 0
-            let oldBalance = startBalance
+        for (let i = 0; i < requestLimit; i++) {
+            try {
+                // 沿用原有请求字段，不增加阅读或浏览信号。
+                const jsonData = {
+                    amount: 1,
+                    id: crypto.randomBytes(64).toString('hex'),
+                    type: 101,
+                    attributes: {
+                        offerid: 'ENUS_readarticle3_30points'
+                    },
+                    country: this.bot.geoLocale
+                }
 
-            for (let i = 0; i < articleCount; i++) {
-                try {
-                    // 每次生成新的随机 id
-                    const jsonData = {
-                        amount: 1,
-                        id: crypto.randomBytes(64).toString('hex'),
-                        type: 101,
-                        attributes: {
-                            offerid: 'ENUS_readarticle3_30points'
-                        },
-                        country: this.bot.geoLocale
-                    }
+                result.requests++
+                const response = await this.bot.httpClient.request({
+                    url: URLS.platform.activities,
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${this.bot.accessToken}`,
+                        'User-Agent': DAPI_USER_AGENT,
+                        'Content-Type': 'application/json',
+                        'X-Rewards-Country': this.bot.geoLocale,
+                        // Script-4：Language 从 en 改为 zh
+                        'X-Rewards-Language': 'zh',
+                        'X-Rewards-ismobile': 'true'
+                    },
+                    data: JSON.stringify(jsonData)
+                })
 
-                    const response = await this.bot.httpClient.request({
-                        url: URLS.platform.activities,
-                        method: 'POST',
-                        headers: {
-                            Authorization: `Bearer ${this.bot.accessToken}`,
-                            'User-Agent': DAPI_USER_AGENT,
-                            'Content-Type': 'application/json',
-                            'X-Rewards-Country': this.bot.geoLocale,
-                            // Script-4：Language 从 en 改为 zh
-                            'X-Rewards-Language': 'zh',
-                            'X-Rewards-ismobile': 'true'
-                        },
-                        data: JSON.stringify(jsonData)
-                    })
-
-                    const newBalance = Number(response?.data?.response?.balance ?? oldBalance)
-                    const gainedPoints = newBalance - oldBalance
-
-                    if (gainedPoints <= 0) {
-                        this.logger.info('READ-TO-EARN', `无积分获得，停止阅读 | 文章 ${i + 1}/${articleCount} | 旧积分: ${oldBalance} | 新积分: ${newBalance}`)
-                        break
-                    }
-
-                    // 更新积分跟踪
-                    this.bot.currentPoints = newBalance
-                    this.bot.gainedPoints += gainedPoints
-                    totalGained += gainedPoints
-                    articlesRead = i + 1
-                    oldBalance = newBalance
-
-                    this.logger.success('READ-TO-EARN', `阅读文章 ${i + 1}/${articleCount} | +${gainedPoints} 积分 | 新积分: ${newBalance}`)
-
-                    // 文章间随机延迟
-                    if (i < articleCount - 1) {
-                        await wait(randomDelay(delayMin, delayMax))
-                    }
-                } catch (error) {
-                    this.logger.error('READ-TO-EARN', `阅读文章 ${i + 1} 失败: ${error.message}`)
+                let observed = this._inspectDapiResponse(response, oldBalance)
+                if (response?.status === undefined) {
+                    observed = { status: 'unconfirmed', gainedPoints: 0, newBalance: null, reason: '响应缺少有效的 HTTP 状态' }
+                }
+                // 只有 HTTP/API 成功且余额有效时，才接受本次实际读数。
+                if (observed.newBalance !== null && observed.status !== 'failed') {
+                    this.bot.currentPoints = observed.newBalance
+                    result.finalBalance = observed.newBalance
+                }
+                if (observed.status !== 'credited') {
+                    result.status = observed.status === 'failed' ? 'failed' : 'unconfirmed'
+                    result[result.status === 'failed' ? 'failed' : 'unconfirmed']++
+                    result.stopReason = result.status === 'failed' ? 'response_rejected' :
+                        (observed.newBalance !== null ? 'no_increase' : 'invalid_response')
+                    result.reason = observed.reason
+                    this.logger[result.status === 'failed' ? 'error' : 'warn']('READ-TO-EARN', `第 ${result.requests} 次请求后停止 | ${observed.reason}；不继续提交`)
                     break
                 }
+
+                this.bot.gainedPoints += observed.gainedPoints
+                result.gainedPoints += observed.gainedPoints
+                result.credited++
+                oldBalance = observed.newBalance
+                this.logger.success('READ-TO-EARN', `已确认到账 ${result.credited} 次 | 本次 +${observed.gainedPoints} 积分 | 新积分: ${observed.newBalance}`)
+
+                if (i < requestLimit - 1) await wait(randomDelay(delayMin, delayMax))
+                else {
+                    result.stopReason = 'request_limit'
+                    result.reason = '已达到原有请求上限'
+                }
+            } catch (error) {
+                result.status = 'unconfirmed'
+                result.unconfirmed++
+                result.stopReason = 'request_error'
+                result.reason = `请求未取得有效响应，结果未确认且不重放 | ${formatError(error)}`
+                this.logger.warn('READ-TO-EARN', `第 ${result.requests} 次请求后停止 | ${result.reason}`)
+                break
             }
-
-            const finalBalance = Number(this.bot.currentPoints ?? startBalance)
-            this.logger.info('READ-TO-EARN', `Read to Earn 完成 | 阅读数: ${articlesRead} | 总获得: +${totalGained} | 起始: ${startBalance} | 最终: ${finalBalance}`)
-        } catch (error) {
-            this.logger.error('READ-TO-EARN', `Read to Earn 错误: ${error.message}`)
         }
-    }
 
+        this.logger[result.status === 'stopped' ? 'info' : 'warn']('READ-TO-EARN', `Read to Earn 处理结束 | 状态: ${result.status} | 请求次数: ${result.requests} | 已到账次数: ${result.credited} | 余额增长: +${result.gainedPoints} | 起始: ${result.startBalance} | 最终: ${result.finalBalance} | 停止原因: ${result.reason}`)
+        return result
+    }
     /**
      * 完成 Punch Card（打卡任务）- Script-4 方案：基于 RSC 解析 + Server Action
      * 移植自 Script-4 Workers.doPunchCards
@@ -3029,7 +3187,7 @@ class RewardsManager {
                 }
             }
         } catch (error) {
-            this.logger.warn('PUNCHCARD', `获取 /earn quest 列表失败: ${error.message}`)
+            this.logger.warn('PUNCHCARD', `获取 /earn quest 列表失败: ${formatError(error)}`)
             return
         }
 
@@ -3077,7 +3235,7 @@ class RewardsManager {
             try {
                 await this._solvePunchCard(parent, apiById.get(parent.offerId), page, isMobile)
             } catch (error) {
-                this.logger.error('PUNCHCARD', `解决 quest "${parent.title || parent.offerId}" 错误: ${error.message}`)
+                this.logger.error('PUNCHCARD', `解决 quest "${parent.title || parent.offerId}" 错误: ${formatError(error)}`)
             }
         }
 
@@ -3091,27 +3249,25 @@ class RewardsManager {
     async _solvePunchCard(parent, apiCard, page, isMobile = true) {
         const parentId = parent.offerId
         const title = parent.title || apiCard?.parentPromotion?.title || parentId
-
-        // 通过 /earn/quest/{id} 页面解析子任务
-        let questChildren = []
+        let questChildren
         try {
-            const res = await page.request.get(URLS.rewards.quest(parentId))
-            if (!res.ok()) {
-                this.logger.warn('PUNCHCARD', `Quest 页面 ${res.status()} - "${title}" - 跳过`)
-                return
-            }
-            questChildren = this.bot.reactParser.snapshotQuestPage(await res.text())
+            questChildren = await this._readQuestChildren(parentId, page)
         } catch (error) {
-            this.logger.warn('PUNCHCARD', `获取 quest 页面失败 "${title}": ${error.message}`)
-            return
+            this.logger.warn('PUNCHCARD', `获取 quest 页面失败 "${title}": ${formatError(error)}`)
+            return { status: 'failed', reason: 'quest-read-failed', remaining: null }
         }
-
+        // 保留本轮已提交但暂未出现在快照中的子任务；消失不表示完成。
+        for (const [key] of this._questSubmissions || []) {
+            const [submittedParentId, offerId] = JSON.parse(key)
+            if (submittedParentId === parentId && !questChildren.some(child => child.offerId === offerId)) {
+                questChildren.push({ offerId, reportable: false, isCompleted: false })
+            }
+        }
         if (!questChildren.length) {
-            this.logger.info('PUNCHCARD', `"${title}" 无可执行的子任务`)
-            return
+            this.logger.warn('PUNCHCARD', `"${title}" 无可确认的子任务`)
+            return { status: 'skipped', reason: 'no-children', remaining: null }
         }
 
-        // 按 API priority 排序
         const apiChildById = new Map(
             (apiCard?.childPromotions || []).filter(c => c.offerId).map(c => [c.offerId, c])
         )
@@ -3119,74 +3275,191 @@ class RewardsManager {
             (apiChildById.get(a.offerId)?.priority ?? Number.MAX_SAFE_INTEGER) -
             (apiChildById.get(b.offerId)?.priority ?? Number.MAX_SAFE_INTEGER)
         )
-
         this.logger.info('PUNCHCARD', `解决 "${title}" | children=${ordered.length} | reportable=${ordered.filter(c => c.reportable).length}`)
 
         const startBalance = Number(this.bot.currentPoints ?? 0)
-        let reported = 0
-        let remaining = 0
-
+        const results = new Map()
         for (const child of ordered) {
             const offerId = child.offerId
             const api = apiChildById.get(offerId)
-
+            if (this._questSubmissions?.has(JSON.stringify([parentId, offerId]))) {
+                const result = this._isClaimChild(offerId, api)
+                    ? await this._doClaimReward(child, parentId, page, isMobile)
+                    : await this._reportQuestChild(child, parentId, page, isMobile)
+                results.set(offerId, result)
+                continue
+            }
+            if (child.isCompleted === true) {
+                results.set(offerId, { status: 'completed', alreadyCompleted: true })
+                continue
+            }
             if (!child.reportable) {
-                remaining++
+                results.set(offerId, { status: 'skipped', reason: 'not-reportable' })
                 this.logger.debug('PUNCHCARD', `跳过 ${offerId}: 不可上报 (locked=${child.isLocked} disabled=${child.isDisabled} done=${child.isCompleted} hash=${!!child.hash})`)
                 continue
             }
-
-            // 跳过多日搜索任务
             if (this._isSearchQuotaChild(offerId, api)) {
-                remaining++
+                results.set(offerId, { status: 'skipped', reason: 'search-quota' })
                 this.logger.info('PUNCHCARD', `跳过 ${offerId}: 多日搜索任务`)
                 continue
             }
-
-            // 领取奖励类子任务
             if (this._isClaimChild(offerId, api)) {
-                const autoClaim = this.bot.config.workers?.autoClaimPunchcardRewards !== false
-                if (!autoClaim) {
-                    remaining++
+                if (this.bot.config.workers?.autoClaimPunchcardRewards === false) {
+                    results.set(offerId, { status: 'skipped', reason: 'auto-claim-disabled' })
                     this.logger.info('PUNCHCARD', `"${title}" 奖励待领取（autoClaimPunchcardRewards=false）| ${offerId}`)
                     continue
                 }
-                await this._doClaimReward(child, parentId, page, isMobile)
-                reported++
+                results.set(offerId, await this._doClaimReward(child, parentId, page, isMobile))
                 continue
             }
-
-            // 上报子任务
-            await this._reportQuestChild(child, parentId, page, isMobile)
-            reported++
+            results.set(offerId, await this._reportQuestChild(child, parentId, page, isMobile))
             await wait(randomDelay(5000, 15000))
         }
 
+        let finalChildren = null
+        try {
+            finalChildren = await this._readQuestChildren(parentId, page)
+            if (!finalChildren.length) {
+                this.logger.warn('PUNCHCARD', `Quest "${title}" 回读未解析到子任务，无法确认整体完成`)
+            }
+            for (const child of finalChildren) {
+                const previous = results.get(child.offerId)
+                if (child.isCompleted === true) {
+                    results.set(child.offerId, { ...previous, status: 'completed', completionConfirmed: true })
+                } else if (!previous) {
+                    results.set(child.offerId, { status: 'skipped', reason: 'new-child-not-submitted' })
+                } else if (previous.status === 'completed') {
+                    results.set(child.offerId, {
+                        ...previous,
+                        status: previous.submitted ? (previous.submissionFailed ? 'failed' : 'submitted') : 'skipped',
+                        completionConfirmed: false,
+                        reason: 'latest-snapshot-incomplete'
+                    })
+                }
+                const submission = this._questSubmissions?.get(JSON.stringify([parentId, child.offerId]))
+                if (submission) {
+                    submission.result = { ...results.get(child.offerId) }
+                    submission.history.push({ ...submission.result })
+                }
+            }
+        } catch (error) {
+            this.logger.warn('PUNCHCARD', `Quest "${title}" 回读失败，无法确认整体完成: ${formatError(error)}`)
+        }
+
+        const counts = { completed: 0, submitted: 0, failed: 0, skipped: 0 }
+        for (const result of results.values()) counts[result.status]++
+        const remaining = results.size - counts.completed
+        const confirmed = finalChildren?.length > 0 &&
+            finalChildren.every(child => child.isCompleted === true) && remaining === 0
         const gained = Number(this.bot.currentPoints ?? 0) - startBalance
-        this.logger.info('PUNCHCARD', `Quest "${title}" ${remaining === 0 ? '完成' : '进行中'} | reported=${reported}${remaining ? ` | remaining=${remaining}` : ''} | +${gained}${parent.pointProgressMax > 0 ? `/${parent.pointProgressMax}` : ''} 积分`,
-            gained > 0 ? 'success' : undefined)
+        const anySubmitted = [...results.values()].some(result => result.submitted === true)
+        const status = confirmed ? 'completed' : counts.failed > 0 ? 'failed' : counts.submitted > 0 || anySubmitted ? 'submitted' : 'skipped'
+        this.logger[confirmed ? 'info' : 'warn']('PUNCHCARD', `Quest "${title}" ${confirmed ? '完成（已回读确认）' : '未确认完成'} | completed=${counts.completed} | submitted=${counts.submitted} | failed=${counts.failed} | skipped=${counts.skipped} | remaining=${remaining} | 余额变化=${gained >= 0 ? '+' : ''}${gained}`)
+        return { status, ...counts, remaining, completionConfirmed: confirmed, gained }
     }
 
-    /**
-     * 上报 quest 子任务 - 移植自 Script-4 Workers.reportQuestChild
-     * 用 Server Action 而非 reportactivity API
-     */
+    // 只读回取任务页面；子任务消失或解析为空不作为完成证据。
+    async _readQuestChildren(parentId, page) {
+        const res = await page.request.get(URLS.rewards.quest(parentId), {
+            headers: { 'Cache-Control': 'no-cache' }
+        })
+        if (!res.ok()) throw new Error(`Quest 页面 HTTP ${res.status()}`)
+        const children = this.bot.reactParser.snapshotQuestPage(await res.text())
+        return Array.isArray(children) ? children : []
+    }
+
+    // 提交应答、余额变化和任务完成分别核验；本方法只读取状态，不重试提交。
+    async _confirmQuestSubmission(child, parentId, page, response, oldBalance, tag, submissionError = null, replayPrevented = false) {
+        let gained = 0
+        let balanceConfirmed = false
+        try {
+            const actionBalance = replayPrevented ? null : response?.availablePoints
+            const newBalance = typeof actionBalance === 'number' && Number.isFinite(actionBalance)
+                ? actionBalance
+                : await this.getCurrentPoints({ fresh: true, required: true })
+            if (typeof newBalance !== 'number' || !Number.isFinite(newBalance)) {
+                throw new Error('积分响应缺少有效余额')
+            }
+            gained = Math.max(0, newBalance - oldBalance)
+            this.bot.currentPoints = newBalance
+            this.bot.gainedPoints += gained
+            balanceConfirmed = true
+        } catch (error) {
+            this.logger.warn(tag, `积分读取未确认 | offerId=${child.offerId} | ${formatError(error)}`)
+        }
+
+        let live = null
+        let readback = '子任务未出现'
+        try {
+            const children = await this._readQuestChildren(parentId, page)
+            live = children.find(item => item.offerId === child.offerId)
+            if (live) readback = live.isCompleted === true ? '已完成' : '未完成'
+        } catch (error) {
+            readback = '快照读取失败'
+            this.logger.warn(tag, `完成状态回读失败 | offerId=${child.offerId} | ${formatError(error)}`)
+        }
+
+        const completionConfirmed = live?.isCompleted === true
+        const failedResponse = response && !(response.status >= 200 && response.status < 300)
+        const status = completionConfirmed ? 'completed' : submissionError || failedResponse ? 'failed' : 'submitted'
+        const detail = `offerId=${child.offerId} | status=${response?.status ?? 'unknown'} | acknowledged=${response?.acknowledged ?? 'unknown'} | 回读=${readback}${balanceConfirmed ? ` | 余额变化=+${gained}` : ' | 余额未确认'}`
+        if (completionConfirmed) {
+            this.logger.success(tag, `任务完成已回读确认 | ${detail}`)
+        } else if (status === 'failed') {
+            this.logger.error(tag, `提交结果未确认 | ${detail}${submissionError ? ` | ${formatError(submissionError)}` : ''}`)
+        } else {
+            this.logger.warn(tag, `已提交，完成状态未确认 | ${detail}`)
+        }
+        const result = {
+            status,
+            offerId: child.offerId,
+            submitted: true,
+            completionConfirmed,
+            balanceConfirmed,
+            gained,
+            acknowledged: response?.acknowledged ?? null,
+            responseStatus: response?.status ?? null,
+            submissionUnknown: !!submissionError,
+            submissionFailed: !!submissionError || !!failedResponse,
+            submissionError: submissionError ? formatError(submissionError) : null,
+            ...(replayPrevented ? { replayPrevented: true } : {})
+        }
+        const submission = this._questSubmissions?.get(JSON.stringify([parentId, child.offerId]))
+        if (submission) {
+            submission.initialResult ??= { ...result }
+            submission.result = { ...result }
+            submission.history.push({ ...result })
+        }
+        return result
+    }
+
     async _reportQuestChild(child, parentId, page, isMobile = true) {
         const offerId = child.offerId
+        const submissionKey = JSON.stringify([parentId, offerId])
+        this._questSubmissions ??= new Map()
+        const previous = this._questSubmissions.get(submissionKey)
+        if (previous) {
+            this.logger.warn('PUNCHCARD', `本轮已提交过此子任务，仅回读状态，不重放 | offerId=${offerId}`)
+            return this._confirmQuestSubmission(child, parentId, page, previous.response,
+                Number(this.bot.currentPoints ?? 0), 'PUNCHCARD', previous.error, true)
+        }
+        if (child.isCompleted === true) return { status: 'completed', alreadyCompleted: true, offerId }
         const actionId = this.bot.nextActions.reportActivity
         if (!actionId) {
             this.logger.warn('PUNCHCARD', `跳过 ${offerId}: "reportActivity" action id 未发现`)
-            return
+            return { status: 'skipped', reason: 'missing-action', offerId }
         }
         if (!child.hash) {
             this.logger.warn('PUNCHCARD', `跳过 ${offerId}: quest child 无实时 hash`)
-            return
+            return { status: 'skipped', reason: 'missing-hash', offerId }
         }
-
         const oldBalance = Number(this.bot.currentPoints ?? 0)
+        const submission = { response: null, error: null, initialResult: null, result: null, history: [] }
+        let response
         try {
             const questUrl = URLS.rewards.quest(parentId)
-            const { status, acknowledged } = await this.reportServerAction(
+            this._questSubmissions.set(submissionKey, submission)
+            response = await this.reportServerAction(
                 actionId,
                 [
                     child.hash,
@@ -3200,47 +3473,46 @@ class RewardsManager {
                 },
                 isMobile
             )
-
-            const newBalance = await this.getCurrentPoints()
-            const gained = newBalance - oldBalance
-            if (gained > 0) {
-                this.bot.currentPoints = newBalance
-                this.bot.gainedPoints += gained
-            }
-
-            this.logger.info('PUNCHCARD', `上报 child | offerId=${offerId} | status=${status} | acknowledged=${acknowledged}${gained > 0 ? ` | +${gained} 积分` : ''}`,
-                gained > 0 || acknowledged ? 'success' : undefined)
+            submission.response = response
         } catch (error) {
-            this.logger.error('PUNCHCARD', `上报 child 错误 | offerId=${offerId} | ${error.message}`)
+            submission.error = error
+            return this._confirmQuestSubmission(child, parentId, page, null, oldBalance, 'PUNCHCARD', error)
         }
+        return this._confirmQuestSubmission(child, parentId, page, response, oldBalance, 'PUNCHCARD')
     }
 
-    /**
-     * 领取 quest 奖励 - 移植自 Script-4 ClaimReward.claimReward
-     * 用 Server Action 领取 punchcard 父任务奖励
-     */
     async _doClaimReward(child, parentId, page, isMobile = true) {
         const offerId = child.offerId
+        const submissionKey = JSON.stringify([parentId, offerId])
+        this._questSubmissions ??= new Map()
+        const previous = this._questSubmissions.get(submissionKey)
+        if (previous) {
+            this.logger.warn('CLAIM-REWARD', `本轮已提交过此子任务，仅回读状态，不重放 | offerId=${offerId}`)
+            return this._confirmQuestSubmission(child, parentId, page, previous.response,
+                Number(this.bot.currentPoints ?? 0), 'CLAIM-REWARD', previous.error, true)
+        }
+        if (child.isCompleted === true) return { status: 'completed', alreadyCompleted: true, offerId }
         const actionId = this.bot.nextActions.reportActivity
         if (!actionId) {
             this.logger.warn('CLAIM-REWARD', `跳过 ${offerId}: "reportActivity" action id 未发现`)
-            return
+            return { status: 'skipped', reason: 'missing-action', offerId }
         }
         if (!child.hash) {
             this.logger.warn('CLAIM-REWARD', `跳过 ${offerId}: 无实时 hash`)
-            return
+            return { status: 'skipped', reason: 'missing-hash', offerId }
         }
         if (!child.reportable) {
             this.logger.warn('CLAIM-REWARD', `跳过 ${offerId}: 不可上报 (已完成/锁定/禁用)`)
-            return
+            return { status: 'skipped', reason: 'not-reportable', offerId }
         }
-
         const oldBalance = Number(this.bot.currentPoints ?? 0)
         this.logger.info('CLAIM-REWARD', `领取奖励 | offerId=${offerId} | geo=${this.bot.geoLocale}`)
-
+        const submission = { response: null, error: null, initialResult: null, result: null, history: [] }
+        let response
         try {
             const questUrl = URLS.rewards.quest(parentId)
-            const { status, acknowledged } = await this.reportServerAction(
+            this._questSubmissions.set(submissionKey, submission)
+            response = await this.reportServerAction(
                 actionId,
                 [
                     child.hash,
@@ -3254,24 +3526,14 @@ class RewardsManager {
                 },
                 isMobile
             )
-
-            const newBalance = await this.getCurrentPoints()
-            const gained = newBalance - oldBalance
-
-            if (acknowledged) {
-                if (gained > 0) {
-                    this.bot.currentPoints = newBalance
-                    this.bot.gainedPoints += gained
-                }
-                this.logger.success('CLAIM-REWARD', `奖励已领取 | offerId=${offerId} | status=${status}${gained > 0 ? ` | +${gained} 积分` : ''}`)
-            } else {
-                this.logger.warn('CLAIM-REWARD', `奖励未被服务器确认 | offerId=${offerId} | status=${status}`)
-            }
-
-            await wait(randomDelay(5000, 10000))
+            submission.response = response
         } catch (error) {
-            this.logger.error('CLAIM-REWARD', `领取奖励错误 | offerId=${offerId} | ${error.message}`)
+            submission.error = error
+            return this._confirmQuestSubmission(child, parentId, page, null, oldBalance, 'CLAIM-REWARD', error)
         }
+        const result = await this._confirmQuestSubmission(child, parentId, page, response, oldBalance, 'CLAIM-REWARD')
+        await wait(randomDelay(5000, 10000))
+        return result
     }
 
     /**
@@ -3301,7 +3563,7 @@ class RewardsManager {
      */
     async doAppPromotions(appData) {
         const appRewards = (appData?.response?.promotions || []).filter(x => {
-            if (x.attributes?.complete?.toLowerCase() !== 'false') return false
+            if (String(x.attributes?.complete).toLowerCase() !== 'false') return false
             if (!x.attributes?.offerid) return false
             if (!x.attributes?.type) return false
             if (x.attributes.type !== 'sapphire') return false
@@ -3309,17 +3571,24 @@ class RewardsManager {
         })
 
         if (!appRewards.length) {
-            this.logger.info('APP-PROMOTIONS', '所有"App 促销"已完成')
+            this.logger.info('APP-PROMOTIONS', '没有待处理的"App 促销"')
             return
         }
 
         this.logger.info('APP-PROMOTIONS', `开始处理 ${appRewards.length} 个"App 促销"`)
+        const result = { credited: 0, unconfirmed: 0, failed: 0, gainedPoints: 0 }
+        const toNumericValue = value => {
+            if (typeof value !== 'number' && typeof value !== 'string') return null
+            if (typeof value === 'string' && !/^-?\d+(?:\.\d+)?$/.test(value.trim())) return null
+            const number = Number(value)
+            return Number.isFinite(number) ? number : null
+        }
 
         for (const reward of appRewards) {
+            let requestCompleted = false
             try {
                 const offerId = reward.attributes.offerid
-                const oldBalance = Number(this.bot.currentPoints ?? 0)
-
+                const oldBalance = toNumericValue(this.bot.currentPoints)
                 const jsonData = this._buildDapiActivityBody(101, { offerid: offerId })
 
                 const response = await this.bot.httpClient.request({
@@ -3328,25 +3597,43 @@ class RewardsManager {
                     headers: this._buildDapiHeaders(true),
                     data: JSON.stringify(jsonData)
                 })
+                requestCompleted = true
 
-                const newBalance = Number(response?.data?.response?.balance ?? oldBalance)
-                const gained = newBalance - oldBalance
-                if (gained > 0) {
-                    this.bot.currentPoints = newBalance
-                    this.bot.gainedPoints += gained
-                    this.logger.success('APP-PROMOTIONS', `完成 ${offerId} | +${gained} 积分`)
+                const apiCode = toNumericValue(response?.data?.code)
+                const newBalance = toNumericValue(response?.data?.response?.balance)
+                if (apiCode === null) {
+                    result.unconfirmed++
+                    this.logger.warn('APP-PROMOTIONS', `活动 ${offerId} 未确认：响应缺少有效的 API 代码`)
+                } else if (apiCode !== 0) {
+                    result.failed++
+                    this.logger.error('APP-PROMOTIONS', `活动 ${offerId} 失败：API 代码 ${apiCode}`)
+                } else if (oldBalance === null || oldBalance < 0 || newBalance === null || newBalance < 0) {
+                    result.unconfirmed++
+                    this.logger.warn('APP-PROMOTIONS', `活动 ${offerId} 未确认：缺少有效的积分余额`)
                 } else {
-                    this.logger.warn('APP-PROMOTIONS', `完成 ${offerId} 但未获得积分`)
+                    const gained = newBalance - oldBalance
+                    this.bot.currentPoints = newBalance
+                    if (gained > 0) {
+                        this.bot.gainedPoints += gained
+                        result.credited++
+                        result.gainedPoints += gained
+                        this.logger.success('APP-PROMOTIONS', `活动 ${offerId} 已到账 | +${gained} 积分`)
+                    } else {
+                        result.unconfirmed++
+                        this.logger.warn('APP-PROMOTIONS', `活动 ${offerId} 未确认到账 | 积分变化: ${gained}`)
+                    }
                 }
-                oldBalance = newBalance
-
-                await wait(randomDelay(5000, 15000))
             } catch (error) {
-                this.logger.error('APP-PROMOTIONS', `App 促销失败: ${error.message}`)
+                result.failed++
+                this.logger.error('APP-PROMOTIONS', `App 促销失败: ${formatError(error)}`)
+            } finally {
+                // 保留每次已完成请求后的原等待，不新增提交或重试。
+                if (requestCompleted) await wait(randomDelay(5000, 15000))
             }
         }
 
-        this.logger.info('APP-PROMOTIONS', '"App 促销"全部完成')
+        this.logger.info('APP-PROMOTIONS', `"App 促销"处理结束 | 已到账: ${result.credited} | 未确认: ${result.unconfirmed} | 失败: ${result.failed} | +${result.gainedPoints} 积分`)
+        return result
     }
 
     /**
@@ -3455,7 +3742,7 @@ class RewardsManager {
 
             await wait(randomDelay(5000, 10000))
         } catch (error) {
-            this.logger.error('ACTIVATE-SEARCH-PERK', `激活搜索特权失败 | offerId=${perk.offerId} | ${error.message}`)
+            this.logger.error('ACTIVATE-SEARCH-PERK', `激活搜索特权失败 | offerId=${perk.offerId} | ${formatError(error)}`)
         }
     }
 
@@ -3538,7 +3825,7 @@ class RewardsManager {
                 this.logger.warn('VISUAL-SEARCH', `上报无 IG (尝试 ${attempt}/${MAX_ATTEMPTS}) - 使用新图片重试`)
                 await wait(randomDelay(3000, 6000))
             } catch (error) {
-                this.logger.error('VISUAL-SEARCH', `视觉搜索失败 (尝试 ${attempt}/${MAX_ATTEMPTS}): ${error.message}`)
+                this.logger.error('VISUAL-SEARCH', `视觉搜索失败 (尝试 ${attempt}/${MAX_ATTEMPTS}): ${formatError(error)}`)
                 await wait(randomDelay(3000, 6000))
             }
         }
@@ -3593,7 +3880,7 @@ class RewardsManager {
             this.logger.warn('VISUAL-SEARCH', `激活未确认 | status=${status}`)
             return 'failed'
         } catch (error) {
-            this.logger.error('VISUAL-SEARCH', `激活失败 | ${error.message}`)
+            this.logger.error('VISUAL-SEARCH', `激活失败 | ${formatError(error)}`)
             return 'failed'
         }
     }
@@ -3736,7 +4023,7 @@ class RewardsManager {
             this.logger.info('VISUAL-SEARCH', `获取 bcid=${bcid.slice(0, 14)} | q="${query}" | status=${res.status}`)
             return { bcid, query, serpUrl }
         } catch (error) {
-            this.logger.warn('VISUAL-SEARCH', `获取 visual search 失败: ${error.message}`)
+            this.logger.warn('VISUAL-SEARCH', `获取 visual search 失败: ${formatError(error)}`)
             return null
         }
     }
@@ -3838,7 +4125,7 @@ class RewardsManager {
             this.logger.info('VISUAL-SEARCH', `浏览器上传成功 | bcid=${bcid.slice(0, 14)} | q="${query}"`)
             return { bcid, query, serpUrl: resultUrl }
         } catch (error) {
-            this.logger.warn('VISUAL-SEARCH', `浏览器文件上传失败: ${error.message}`)
+            this.logger.warn('VISUAL-SEARCH', `浏览器文件上传失败: ${formatError(error)}`)
             return null
         }
     }
@@ -4036,7 +4323,7 @@ class RewardsManager {
             this._dashboardCache = null
             dashboard = await this.getDashboardData()
         } catch (e) {
-            this.logger.warn('SEARCH-BONUS', `获取仪表盘失败，跳过: ${e.message}`)
+            this.logger.warn('SEARCH-BONUS', `获取仪表盘失败，跳过: ${formatError(e)}`)
             return 0
         }
 
@@ -4101,7 +4388,7 @@ class RewardsManager {
             try {
                 await searchManager._bingSearch(page, query, isMobile)
             } catch (e) {
-                this.logger.warn('SEARCH-BONUS', `搜索失败 "${query}": ${e.message}`)
+                this.logger.warn('SEARCH-BONUS', `搜索失败 "${query}": ${formatError(e)}`)
             }
 
             await wait(randomDelay(this.bot.config.search.searchDelayMin, this.bot.config.search.searchDelayMax))
@@ -4143,7 +4430,7 @@ class RewardsManager {
                     break
                 }
             } catch (e) {
-                this.logger.debug('SEARCH-BONUS', `检查进度失败: ${e.message}`)
+                this.logger.debug('SEARCH-BONUS', `检查进度失败: ${formatError(e)}`)
             }
         }
 
@@ -4224,7 +4511,7 @@ class RewardsManager {
                         }
                     }
                 } catch (error) {
-                    this.logger.debug('ENABLE-STREAK-PROTECTION', `从 streaks 页面发现 action ids 失败: ${error.message}`)
+                    this.logger.debug('ENABLE-STREAK-PROTECTION', `从 streaks 页面发现 action ids 失败: ${formatError(error)}`)
                 }
             }
         }
@@ -4272,7 +4559,7 @@ class RewardsManager {
 
             await wait(randomDelay(5000, 10000))
         } catch (error) {
-            this.logger.error('ENABLE-STREAK-PROTECTION', `启用连续登录保护失败: ${error.message}`)
+            this.logger.error('ENABLE-STREAK-PROTECTION', `启用连续登录保护失败: ${formatError(error)}`)
         }
     }
 
@@ -4292,7 +4579,7 @@ class RewardsManager {
             const html = await res.text()
             return this.bot.reactParser.parseStreakProtection(this.bot.reactParser.concatFlightChunks(html))
         } catch (error) {
-            this.logger.warn('ENABLE-STREAK-PROTECTION', `验证读取异常: ${error.message}`)
+            this.logger.warn('ENABLE-STREAK-PROTECTION', `验证读取异常: ${formatError(error)}`)
             return null
         }
     }
@@ -4334,80 +4621,107 @@ class SearchManager {
      * 执行搜索任务
      */
     async doSearches(page, isMobile) {
-        let searchPoints, missing
+        const platform = isMobile ? '移动端' : '桌面端'
+        const result = { status: 'unknown', reason: '', detail: '', gainedPoints: 0, attempted: false,
+            searchesAttempted: 0, searchFailures: 0, remainingPoints: null, maxPoints: null }
+        const finish = (status, reason, detail) => {
+            Object.assign(result, { status, reason, detail })
+            const labels = { complete: '额度已满（已确认）', skipped: '跳过', unknown: '状态未知', partial: '已停止，额度未满', failed: '失败' }
+            const message = `${platform}搜索${labels[status]} | ${detail} | 获得: ${result.gainedPoints} 积分 | 搜索次数: ${result.searchesAttempted}`
+            if (status === 'failed') this.logger.error('SEARCH', message)
+            else if (status === 'unknown' || status === 'partial') this.logger.warn('SEARCH', message)
+            else this.logger.info('SEARCH', message)
+            return { ...result }
+        }
+        const readMissing = async () => {
+            const counters = await this.bot.rewards.getSearchPoints()
+            const missing = this.bot.rewards.missingSearchPoints(counters, isMobile)
+            if (!missing?.known || !Number.isSafeInteger(missing.max) || missing.max < 0 ||
+                !Number.isSafeInteger(missing.totalPoints) || missing.totalPoints < 0 || missing.totalPoints > missing.max) {
+                throw new Error('搜索计数缺失或无效')
+            }
+            return missing
+        }
+
+        let missing
         try {
-            searchPoints = await this.bot.rewards.getSearchPoints()
-            missing = this.bot.rewards.missingSearchPoints(searchPoints, isMobile)
+            missing = await readMissing()
         } catch (error) {
-            this.logger.warn('SEARCH', `获取搜索积分失败，使用默认值: ${error.message}`)
-            // 无法获取积分信息时，假设需要搜索（桌面端 30 积分）
-            missing = { mobilePoints: 0, desktopPoints: isMobile ? 0 : 30, edgePoints: 0, totalPoints: isMobile ? 0 : 30 }
+            return finish('unknown', 'quota_read_failed', `搜索额度读取失败，本次不猜测执行 | ${formatError(error)}`)
         }
-
-        if (missing.totalPoints <= 0) {
-            this.logger.info('SEARCH', `${isMobile ? '移动端' : '桌面端'}搜索积分已满`)
-            return 0
+        result.remainingPoints = missing.totalPoints
+        result.maxPoints = missing.max
+        if (missing.max === 0) return finish('skipped', 'quota_unavailable', '账户明确未提供此平台搜索额度')
+        if (missing.totalPoints === 0) return finish('complete', 'quota_already_full', '新鲜搜索计数确认额度已满')
+        if (!page || typeof page.goto !== 'function' || page.isClosed?.()) {
+            return finish('failed', 'page_unavailable', '浏览器页面不可用，无法执行搜索')
         }
-
-        this.logger.info('SEARCH', `${isMobile ? '移动端' : '桌面端'}搜索开始 | 缺失积分: ${missing.totalPoints}`)
 
         const queries = this._getQueries()
+        const configuredLimit = this.bot.config.search.maxSearches ?? 100
+        if (!Number.isSafeInteger(configuredLimit) || configuredLimit < 0) {
+            return finish('failed', 'invalid_search_limit', 'maxSearches 必须为非负整数')
+        }
+        const maxSearches = Math.min(queries.length, configuredLimit)
+        if (maxSearches === 0) return finish('partial', 'max_searches_reached', '没有可执行搜索次数，额度仍未满')
+        this.logger.info('SEARCH', `${platform}搜索开始 | 缺失积分: ${missing.totalPoints}`)
         const bingHome = isMobile ? 'https://cn.bing.com/?form=BNRDOI' : 'https://cn.bing.com'
+        try {
+            result.attempted = true
+            await page.goto(bingHome)
+            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
+            await this._dismissMessages(page)
+        } catch (error) {
+            return finish('failed', 'page_initialization_failed', `搜索页面初始化失败 | ${formatError(error)}`)
+        }
 
-        await page.goto(bingHome)
-        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
-        await this._dismissMessages(page)
-
-        let totalGained = 0
         let stagnantLoop = 0
         const stagnantLimit = this.bot.config.search.stagnantLimit
         let lastMissing = missing.totalPoints
-
-        for (let i = 0; i < queries.length; i++) {
+        for (let i = 0; i < maxSearches; i++) {
             const query = queries[i]
-
+            result.searchesAttempted++
             try {
                 await this._bingSearch(page, query, isMobile)
             } catch (error) {
-                this.logger.warn('SEARCH', `搜索失败 "${query}": ${error.message}`)
+                result.searchFailures++
+                this.logger.warn('SEARCH', `搜索失败 "${query}": ${formatError(error)}`)
             }
 
-            // 检查积分变化
+            // 每次搜索后只使用新鲜计数；读数异常立即停止，不猜测额度或继续请求。
+            let newMissing
             try {
-                const newCounters = await this.bot.rewards.getSearchPoints()
-                const newMissing = this.bot.rewards.missingSearchPoints(newCounters, isMobile)
-                const gained = Math.max(0, lastMissing - newMissing.totalPoints)
-                lastMissing = newMissing.totalPoints
-
-                if (gained > 0) {
-                    stagnantLoop = 0
-                    totalGained += gained
-                    this.bot.currentPoints += gained
-                    this.bot.gainedPoints += gained
-                    this.logger.success('SEARCH', `+${gained} 积分 | "${query}" | 剩余: ${newMissing.totalPoints}`)
-                } else {
-                    stagnantLoop++
-                    this.logger.info('SEARCH', `无积分 ${stagnantLoop}/${stagnantLimit} | "${query}" | 剩余: ${newMissing.totalPoints}`)
-                }
-
-                if (newMissing.totalPoints <= 0) {
-                    this.logger.success('SEARCH', `${isMobile ? '移动端' : '桌面端'}搜索积分已满`)
-                    break
-                }
-
-                if (stagnantLoop >= stagnantLimit) {
-                    this.logger.warn('SEARCH', `连续 ${stagnantLimit} 次无积分，停止搜索`)
-                    break
-                }
+                newMissing = await readMissing()
             } catch (error) {
-                this.logger.debug('SEARCH', `检查积分失败: ${error.message}`)
+                return finish('unknown', 'quota_recheck_failed', `搜索计数回读失败，已停止本轮 | ${formatError(error)}`)
             }
-
+            if (newMissing.max !== result.maxPoints || newMissing.totalPoints > lastMissing) {
+                return finish('unknown', 'quota_changed', '搜索额度或进度发生异常变化，无法确认本轮状态，已停止')
+            }
+            const gained = lastMissing - newMissing.totalPoints
+            lastMissing = newMissing.totalPoints
+            result.remainingPoints = newMissing.totalPoints
+            if (gained > 0) {
+                stagnantLoop = 0
+                result.gainedPoints += gained
+                const observed = this.bot.rewards._readDashboardBalance(this.bot.rewards._dashboardCache)
+                if (observed !== null) this.bot.currentPoints = observed
+                this.bot.gainedPoints += gained
+                this.logger.success('SEARCH', `+${gained} 积分 | "${query}" | 剩余: ${newMissing.totalPoints}`)
+            } else {
+                stagnantLoop++
+                this.logger.info('SEARCH', `无积分 ${stagnantLoop}/${stagnantLimit} | "${query}" | 剩余: ${newMissing.totalPoints}`)
+            }
+            if (newMissing.totalPoints === 0) return finish('complete', 'quota_filled', '搜索后新鲜计数确认额度已满')
+            if (page.isClosed?.()) return finish('failed', 'page_closed', '浏览器页面已关闭，额度尚未满')
+            if (stagnantLoop >= stagnantLimit) {
+                const allFailed = result.searchFailures === result.searchesAttempted
+                return finish(allFailed ? 'failed' : 'partial', allFailed ? 'search_requests_failed' : 'stagnant',
+                    allFailed ? `连续 ${stagnantLimit} 次搜索请求失败，已停止` : `连续 ${stagnantLimit} 次无积分，额度尚未满`)
+            }
             await wait(randomDelay(this.bot.config.search.searchDelayMin, this.bot.config.search.searchDelayMax))
         }
-
-        this.logger.info('SEARCH', `${isMobile ? '移动端' : '桌面端'}搜索完成 | 获得: ${totalGained} 积分`)
-        return totalGained
+        return finish('partial', 'max_searches_reached', '已达到本轮最大搜索次数，额度尚未满')
     }
 
     _getQueries() {
@@ -4465,6 +4779,169 @@ class SearchManager {
 // ============================================================================
 // 主机器人类
 // ============================================================================
+// Dependencies: the script's existing fs, path, crypto and URL imports.
+// Official referral entry is attempted once per account and invitation code.
+class ReferralManager {
+    constructor(bot, logger) {
+        this.bot = bot
+        this.logger = logger
+    }
+
+    _settings() {
+        const configured = this.bot.config.referral
+        if (configured && typeof configured !== 'object') return null
+        const settings = { enabled: true, code: 'A97B601D', source: 'rafsrchae', ...configured }
+        if (settings.enabled === false) return { enabled: false }
+        if (typeof settings.code !== 'string' || !/^[a-z0-9]{1,32}$/i.test(settings.code)) return null
+        if (typeof settings.source !== 'string' || !/^[a-z0-9_-]{1,64}$/i.test(settings.source)) return null
+        return settings
+    }
+
+    _stateFile(code) {
+        const email = this.bot.account.email
+        const sessionRoot = this.bot.config.sessionPath
+        // Keep this file inside one direct account directory. Reject filename and
+        // path syntax rather than converting an unsafe account into another one.
+        if (typeof email !== 'string' || !email || email.length > 254 || email.trim() !== email ||
+            /[<>:"/\\|?*\x00-\x1f]/.test(email) || /[. ]$/.test(email) || email === '.' || email === '..' ||
+            /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(email) ||
+            typeof sessionRoot !== 'string' || !sessionRoot) {
+            return null
+        }
+        const root = path.resolve(sessionRoot)
+        const directory = path.resolve(root, email)
+        if (path.dirname(directory) !== root) return null
+        return path.join(directory, `referral-${code}.json`)
+    }
+
+    _entryUrl(settings) {
+        const target = new URL('https://rewards.bing.com/refer/join')
+        for (const [key, value] of Object.entries({
+            rh: settings.code,
+            ref: settings.source,
+            form: 'ML2XJD',
+            OCID: 'ML2XJD',
+            PUBL: 'RewardsDO',
+            CREA: 'ML2XJD'
+        })) target.searchParams.set(key, value)
+        return target.toString()
+    }
+
+    async _writeState(file, state, firstAttempt) {
+        const directory = path.dirname(file)
+        await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 })
+        const directoryInfo = await fs.promises.lstat(directory)
+        if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error('Unsafe state directory')
+        await fs.promises.chmod(directory, 0o700)
+
+        const temporary = path.join(directory, `.referral-${state.code}-${crypto.randomBytes(8).toString('hex')}.tmp`)
+        let handle
+        try {
+            handle = await fs.promises.open(temporary, 'wx', 0o600)
+            await handle.writeFile(JSON.stringify(state, null, 2), 'utf8')
+            await handle.sync()
+            await handle.close()
+            handle = null
+            if (firstAttempt) {
+                // Publishing a prepared file with link is atomic and exclusive:
+                // two overlapping script runs cannot both submit the invitation.
+                await fs.promises.link(temporary, file)
+            } else {
+                await fs.promises.rename(temporary, file)
+            }
+        } finally {
+            if (handle) await handle.close().catch(() => {})
+            await fs.promises.unlink(temporary).catch(() => {})
+        }
+    }
+
+    _capture(page, code, attemptedAt, reason) {
+        const state = {
+            version: 1,
+            code,
+            status: 'unknown',
+            attemptedAt,
+            updatedAt: new Date().toISOString(),
+            reason
+        }
+        try {
+            const result = new URL(page.url())
+            if (result.origin === 'https://rewards.bing.com') {
+                // Store only known public route names, never arbitrary URL paths,
+                // page bodies, cookies, authentication queries or identifiers.
+                const routes = new Set(['/', '/about', '/welcome', '/refer', '/refer/join', '/dashboard', '/earn', '/createuser'])
+                state.pathname = routes.has(result.pathname) ? result.pathname : 'other_route'
+                const msgid = result.searchParams.get('msgid')
+                if (msgid && /^[a-z0-9_-]{1,64}$/i.test(msgid)) state.msgid = msgid
+            } else {
+                state.pathname = 'other_origin'
+            }
+        } catch {
+            state.pathname = 'unavailable'
+        }
+        // No success or rejection codes have been verified. In particular,
+        // dashboard, HTTP 200 and msgid=rejoinsuccess do not prove attribution.
+        return state
+    }
+
+    async beforeLogin(page) {
+        const settings = this._settings()
+        if (!settings) {
+            return { attempted: false, status: 'skipped', reason: 'invalid_config' }
+        }
+        if (!settings.enabled) return { attempted: false, status: 'skipped', reason: 'disabled' }
+        const file = this._stateFile(settings.code)
+        if (!file) {
+            return { attempted: false, status: 'skipped', reason: 'invalid_path' }
+        }
+
+        try {
+            await fs.promises.lstat(file)
+            return { attempted: false, status: 'skipped', reason: 'existing_state' }
+        } catch (error) {
+            if (error.code !== 'ENOENT') {
+                return { attempted: false, status: 'skipped', reason: 'state_unavailable' }
+            }
+        }
+
+        const attemptedAt = new Date().toISOString()
+        const initialState = { version: 1, code: settings.code, status: 'attempting', attemptedAt }
+        try {
+            await this._writeState(file, initialState, true)
+        } catch (error) {
+            if (error.code === 'EEXIST') {
+                return { attempted: false, status: 'skipped', reason: 'existing_state' }
+            }
+            return { attempted: false, status: 'skipped', reason: 'state_write_failed' }
+        }
+
+        let captured = false
+        let outcome
+        const capture = async reason => {
+            if (captured) return
+            captured = true
+            outcome = this._capture(page, settings.code, attemptedAt, reason)
+            try {
+                await this._writeState(file, outcome, false)
+            } catch {
+                // The durable initial attempting marker still prevents retries.
+            }
+        }
+
+        try {
+            await this.bot.loginManager.login(page, this.bot.account, {
+                entryUrl: this._entryUrl(settings),
+                onAuthenticated: async () => capture('official_feedback_unverified'),
+                finalize: false
+            })
+            if (!captured) await capture('authentication_callback_missing')
+        } catch {
+            if (!captured) await capture('login_failed')
+        }
+        return { attempted: true, status: 'unknown', reason: outcome?.reason || 'result_unavailable' }
+    }
+}
+
 class MicrosoftRewardsBot {
     constructor(config, account, logger) {
         this.config = config
@@ -4475,7 +4952,7 @@ class MicrosoftRewardsBot {
         this.geoLocale = 'US'
         this.langCode = account.langCode || 'en'
         this.timezoneOffset = String(-new Date().getTimezoneOffset())
-        this.initialPoints = 0
+        this.initialPoints = null
         this.currentPoints = 0
         this.gainedPoints = 0
 
@@ -4496,6 +4973,7 @@ class MicrosoftRewardsBot {
         this.sessionManager = new SessionManager(config.sessionPath, logger)
         this.browserManager = new BrowserManager(config, logger)
         this.loginManager = new LoginManager(this, logger)
+        this.referrals = new ReferralManager(this, logger)
         this.rewards = new RewardsManager(this, logger)
         this.searchManager = new SearchManager(this, logger)
         this.httpClient = new HttpClient(account.proxy, logger)
@@ -4542,6 +5020,9 @@ class MicrosoftRewardsBot {
 
             const mobilePage = await mobileContext.newPage()
 
+            //
+            await this.referrals.beforeLogin(mobilePage)
+
             // 登录
             await this.loginManager.login(mobilePage, this.account)
             this.cookies = await mobileContext.cookies()
@@ -4551,7 +5032,7 @@ class MicrosoftRewardsBot {
             try {
                 this.accessToken = await this.loginManager.getAppAccessToken(mobilePage, accountEmail)
             } catch (error) {
-                this.logger.warn('FLOW', `获取访问令牌失败: ${error.message}`)
+                this.logger.warn('FLOW', `获取访问令牌失败: ${formatError(error)}`)
             }
 
             // 获取仪表盘数据
@@ -4559,11 +5040,12 @@ class MicrosoftRewardsBot {
             const dashboardData = await this.rewards.getDashboardData()
 
             this.geoLocale =
-                this.account.geoLocale === 'auto'
+                (!this.account.geoLocale || this.account.geoLocale === 'auto')
                     ? dashboardData.userProfile?.attributes?.country || 'US'
                     : this.account.geoLocale.toLowerCase()
 
-            this.initialPoints = dashboardData.userStatus?.availablePoints ?? 0
+            this.initialPoints = this.rewards._readDashboardBalance(dashboardData)
+            if (this.initialPoints === null) throw new Error('初始余额缺失，停止任务以避免错误统计')
             this.currentPoints = this.initialPoints
             this.logger.info('FLOW', `当前积分: ${this.initialPoints} | 地区: ${this.geoLocale}`)
 
@@ -4572,14 +5054,14 @@ class MicrosoftRewardsBot {
             try {
                 appDashboardData = await this.rewards.getAppDashboardData()
             } catch (error) {
-                this.logger.warn('FLOW', `获取应用仪表盘数据失败: ${error.message}`)
+                this.logger.warn('FLOW', `获取应用仪表盘数据失败: ${formatError(error)}`)
             }
 
             // Script-4：bootstrap（获取 /earn HTML → reactSnapshot + action ids）
             try {
                 await this.rewards.bootstrap(mobilePage, true)
             } catch (error) {
-                this.logger.warn('FLOW', `移动端 bootstrap 失败（非致命）: ${error.message}`)
+                this.logger.warn('FLOW', `移动端 bootstrap 失败（非致命）: ${formatError(error)}`)
             }
 
             // ==================================================================
@@ -4588,7 +5070,7 @@ class MicrosoftRewardsBot {
             const workers = this.config.workers
             const _taskWait = async (taskName) => {
                 const delaySec = randomNumber(15, 60)
-                this.logger.info('FLOW', `任务 "${taskName}" 完成，等待 ${delaySec} 秒后继续下一个任务`)
+                this.logger.info('FLOW', `阶段 "${taskName}" 处理结束，等待 ${delaySec} 秒后继续下一个任务`)
                 await wait(delaySec * 1000)
             }
 
@@ -4622,7 +5104,7 @@ class MicrosoftRewardsBot {
                 try {
                     await this.rewards.doPunchCards(dashboardData, mobilePage, true)
                 } catch (error) {
-                    this.logger.error('FLOW', `PunchCard 移动端阶段失败: ${error.message}`)
+                    this.logger.error('FLOW', `PunchCard 移动端阶段失败: ${formatError(error)}`)
                 }
                 await _taskWait('打卡任务(移动端)')
             }
@@ -4641,13 +5123,19 @@ class MicrosoftRewardsBot {
             // 移动端搜索
             if (workers.doMobileSearch) {
                 this.logger.info('FLOW', '开始移动端搜索')
+                let searchAttempted = false
                 try {
-                    const mobilePoints = await this.searchManager.doSearches(mobilePage, true)
-                    this.logger.info('FLOW', `移动端搜索完成 | +${mobilePoints} 积分`)
+                    const searchResult = await this.searchManager.doSearches(mobilePage, true)
+                    searchAttempted = searchResult.attempted
+                    const labels = { complete: '额度已满（已确认）', skipped: '跳过', unknown: '状态未知', partial: '已停止，额度未满', failed: '失败' }
+                    const message = `移动端搜索${labels[searchResult.status] || '状态未知'} | ${searchResult.detail || searchResult.reason} | +${searchResult.gainedPoints} 积分`
+                    if (searchResult.status === 'failed') this.logger.error('FLOW', message)
+                    else if (['unknown', 'partial'].includes(searchResult.status)) this.logger.warn('FLOW', message)
+                    else this.logger.info('FLOW', message)
                 } catch (error) {
-                    this.logger.error('FLOW', `移动端搜索失败: ${error.message}`)
+                    this.logger.error('FLOW', `移动端搜索失败: ${formatError(error)}`)
                 }
-                await _taskWait('移动端搜索')
+                if (searchAttempted) await _taskWait('移动端搜索')
             }
 
             // 额外搜索 farming（移动端）
@@ -4655,7 +5143,7 @@ class MicrosoftRewardsBot {
                 try {
                     await this.rewards.doBonusSearches(mobilePage, true)
                 } catch (error) {
-                    this.logger.error('FLOW', `额外搜索 farming(移动端) 失败: ${error.message}`)
+                    this.logger.error('FLOW', `额外搜索 farming(移动端) 失败: ${formatError(error)}`)
                 }
                 await _taskWait('额外搜索 farming(移动端)')
             }
@@ -4711,7 +5199,7 @@ class MicrosoftRewardsBot {
                     this.desktopCookies = await desktopContext.cookies()
                     await this.sessionManager.saveCookies(accountEmail, false, this.desktopCookies)
                 } catch (error) {
-                    this.logger.warn('FLOW', `桌面端登录失败（尝试复用移动端 cookies）: ${error.message}`)
+                    this.logger.warn('FLOW', `桌面端登录失败（尝试复用移动端 cookies）: ${formatError(error)}`)
                     this.desktopCookies = [...this.cookies]
                 }
 
@@ -4719,7 +5207,7 @@ class MicrosoftRewardsBot {
                 try {
                     await this.rewards.bootstrap(desktopPage, false)
                 } catch (error) {
-                    this.logger.warn('FLOW', `桌面端 bootstrap 失败（非致命）: ${error.message}`)
+                    this.logger.warn('FLOW', `桌面端 bootstrap 失败（非致命）: ${formatError(error)}`)
                 }
 
                 // ==================================================================
@@ -4733,7 +5221,7 @@ class MicrosoftRewardsBot {
                         const desktopDashboardData = await this.rewards.getDashboardData()
                         await this.rewards.doPunchCards(desktopDashboardData, desktopPage, false)
                     } catch (error) {
-                        this.logger.error('FLOW', `PunchCard 桌面端阶段失败: ${error.message}`)
+                        this.logger.error('FLOW', `PunchCard 桌面端阶段失败: ${formatError(error)}`)
                     }
                     await _taskWait('打卡任务(桌面端)')
                 }
@@ -4741,13 +5229,19 @@ class MicrosoftRewardsBot {
                 // 桌面端搜索
                 if (workers.doDesktopSearch) {
                     this.logger.info('FLOW', '开始桌面端搜索')
+                    let searchAttempted = false
                     try {
-                        const desktopPoints = await this.searchManager.doSearches(desktopPage, false)
-                        this.logger.info('FLOW', `桌面端搜索完成 | +${desktopPoints} 积分`)
+                        const searchResult = await this.searchManager.doSearches(desktopPage, false)
+                        searchAttempted = searchResult.attempted
+                        const labels = { complete: '额度已满（已确认）', skipped: '跳过', unknown: '状态未知', partial: '已停止，额度未满', failed: '失败' }
+                        const message = `桌面端搜索${labels[searchResult.status] || '状态未知'} | ${searchResult.detail || searchResult.reason} | +${searchResult.gainedPoints} 积分`
+                        if (searchResult.status === 'failed') this.logger.error('FLOW', message)
+                        else if (['unknown', 'partial'].includes(searchResult.status)) this.logger.warn('FLOW', message)
+                        else this.logger.info('FLOW', message)
                     } catch (error) {
-                        this.logger.error('FLOW', `桌面端搜索失败: ${error.message}`)
+                        this.logger.error('FLOW', `桌面端搜索失败: ${formatError(error)}`)
                     }
-                    await _taskWait('桌面端搜索')
+                    if (searchAttempted) await _taskWait('桌面端搜索')
                 }
 
                 // 视觉搜索（仅桌面端）—— [已关闭] kblob API 在中国地区因 TLS 指纹检测返回 400，Script-3 axios 无法通过
@@ -4755,7 +5249,7 @@ class MicrosoftRewardsBot {
                     try {
                         await this.rewards.doVisualSearch(desktopPage)
                     } catch (error) {
-                        this.logger.error('FLOW', `视觉搜索失败: ${error.message}`)
+                        this.logger.error('FLOW', `视觉搜索失败: ${formatError(error)}`)
                     }
                     await _taskWait('视觉搜索')
                 } else {
@@ -4767,7 +5261,7 @@ class MicrosoftRewardsBot {
                     try {
                         await this.rewards.doBonusSearches(desktopPage, false)
                     } catch (error) {
-                        this.logger.error('FLOW', `额外搜索 farming(桌面端) 失败: ${error.message}`)
+                        this.logger.error('FLOW', `额外搜索 farming(桌面端) 失败: ${formatError(error)}`)
                     }
                     await _taskWait('额外搜索 farming(桌面端)')
                 }
@@ -4795,12 +5289,12 @@ class MicrosoftRewardsBot {
             }
 
             // 获取最终积分
-            const finalPoints = await this.rewards.getCurrentPoints()
+            const finalPoints = await this.rewards.getCurrentPoints({ fresh: true, required: true })
             const collected = finalPoints - this.initialPoints
 
-            this.logger.success(
+            this.logger.info(
                 'FLOW',
-                `账户 ${accountEmail} 完成 | 初始: ${this.initialPoints} | 最终: ${finalPoints} | 获得: +${collected} 积分`
+                `账户 ${accountEmail} 流程结束 | 初始: ${this.initialPoints} | 最终: ${finalPoints} | 获得: +${collected} 积分`
             )
 
             return {
@@ -4808,17 +5302,23 @@ class MicrosoftRewardsBot {
                 initialPoints: this.initialPoints,
                 finalPoints,
                 collectedPoints: collected,
-                success: true
+                success: !this.logger.issues?.some(item => item.level === 'error'),
+                flowCompleted: true,
+                partial: Boolean(this.logger.issues?.length),
+                taskWarningCount: this.logger.issues?.filter(item => item.level === 'warn').length || 0,
+                taskErrorCount: this.logger.issues?.filter(item => item.level === 'error').length || 0
             }
         } catch (error) {
-            this.logger.error('FLOW', `账户 ${accountEmail} 失败: ${error.message}`)
+            this.logger.error('FLOW', `账户 ${accountEmail} 失败: ${formatError(error)}`)
             return {
                 email: accountEmail,
                 initialPoints: this.initialPoints,
-                finalPoints: this.currentPoints,
-                collectedPoints: this.gainedPoints,
+                finalPoints: null,
+                lastKnownPoints: this.currentPoints,
+                flowCompleted: false,
+                collectedPoints: null,
                 success: false,
-                error: error.message
+                error: formatError(error)
             }
         } finally {
             // 清理移动端浏览器资源
@@ -4879,10 +5379,14 @@ async function main() {
     let config = createDefaultConfig()
     const configFromFile = loadConfigFile(path.join(__dirname, 'config.json'))
     if (configFromFile) {
+        const defaults = config
         config = { ...config, ...configFromFile }
-        if (configFromFile.workers) config.workers = { ...config.workers, ...configFromFile.workers }
-        if (configFromFile.search) config.search = { ...config.search, ...configFromFile.search }
-        if (configFromFile.browser) config.browser = { ...config.browser, ...configFromFile.browser }
+        if (configFromFile.workers) config.workers = { ...defaults.workers, ...configFromFile.workers }
+        if (configFromFile.search) config.search = { ...defaults.search, ...configFromFile.search }
+        if (configFromFile.browser) config.browser = { ...defaults.browser, ...configFromFile.browser }
+        if (configFromFile.referral && typeof configFromFile.referral === 'object') {
+            config.referral = { ...createDefaultConfig().referral, ...configFromFile.referral }
+        }
     }
 
     // 命令行覆盖
@@ -4932,14 +5436,14 @@ async function main() {
             const stats = await bot.run()
             allStats.push(stats)
         } catch (error) {
-            accountLogger.error('MAIN', `未捕获的错误: ${error.message}`)
+            accountLogger.error('MAIN', `未捕获的错误: ${formatError(error)}`)
             allStats.push({
                 email: account.email,
-                initialPoints: 0,
-                finalPoints: 0,
-                collectedPoints: 0,
+                initialPoints: null,
+                finalPoints: null,
+                collectedPoints: null,
                 success: false,
-                error: error.message
+                error: formatError(error)
             })
         }
 
@@ -4955,25 +5459,33 @@ async function main() {
     }
 
     // 汇总报告
-    const totalCollected = allStats.reduce((sum, s) => sum + s.collectedPoints, 0)
-    const totalInitial = allStats.reduce((sum, s) => sum + s.initialPoints, 0)
-    const totalFinal = allStats.reduce((sum, s) => sum + s.finalPoints, 0)
-    const successCount = allStats.filter(s => s.success).length
+    const displayPoints = value => typeof value === "number" && Number.isFinite(value) ? value : "未确认"
+    const unknownCount = allStats.filter(stat => stat.finalPoints === null || stat.collectedPoints === null).length
+    const sumConfirmed = key => {
+        const values = allStats.map(stat => stat[key]).filter(value => typeof value === 'number' && Number.isFinite(value))
+        return values.length ? values.reduce((sum, value) => sum + value, 0) : null
+    }
+    const displayDelta = value => typeof value === 'number' && Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${value}` : '未确认'
+    const totalCollected = sumConfirmed('collectedPoints')
+    const totalInitial = sumConfirmed('initialPoints')
+    const totalFinal = sumConfirmed('finalPoints')
+    const successCount = allStats.filter(s => s.success && !s.partial).length
+    const partialCount = allStats.filter(s => s.flowCompleted && s.partial).length
     const durationMinutes = ((Date.now() - runStartTime) / 1000 / 60).toFixed(1)
 
     mainLogger.info('MAIN', '========== 运行汇总 ==========', COLORS.cyan)
-    mainLogger.info('MAIN', `账户总数: ${allStats.length} | 成功: ${successCount} | 失败: ${allStats.length - successCount}`)
-    mainLogger.info('MAIN', `初始积分总和: ${totalInitial}`)
-    mainLogger.info('MAIN', `最终积分总和: ${totalFinal}`)
-    mainLogger.info('MAIN', `获得积分总计: +${totalCollected}`)
+    mainLogger.info('MAIN', `账户总数: ${allStats.length} | 无异常: ${successCount} | 有提示: ${partialCount} | 流程失败: ${allStats.length - successCount - partialCount}`)
+    mainLogger.info('MAIN', `初始积分总和: ${displayPoints(totalInitial)}`)
+    mainLogger.info('MAIN', `最终积分总和: ${displayPoints(totalFinal)}`)
+    mainLogger.info('MAIN', `已确认账户获得积分总计: ${displayDelta(totalCollected)} | 未确认账户: ${unknownCount}`)
     mainLogger.info('MAIN', `运行时长: ${durationMinutes} 分钟`)
     mainLogger.info('MAIN', '==============================', COLORS.cyan)
 
     // 打印每个账户的详情
     for (const stat of allStats) {
-        const status = stat.success ? '成功' : '失败'
+        const status = stat.flowCompleted ? (stat.partial ? '流程结束（存在待确认/异常）' : '流程结束') : '流程失败'
         const color = stat.success ? COLORS.green : COLORS.red
-        mainLogger.info('MAIN', `${stat.email} | ${status} | +${stat.collectedPoints} 积分 | ${stat.initialPoints} → ${stat.finalPoints}`, color)
+        mainLogger.info('MAIN', `${stat.email} | ${status} | ${displayDelta(stat.collectedPoints)} 积分 | ${displayPoints(stat.initialPoints)} → ${displayPoints(stat.finalPoints)}`, color)
         if (stat.error) {
             mainLogger.warn('MAIN', `  错误: ${stat.error}`)
         }
@@ -5005,9 +5517,16 @@ async function main() {
         let notifyBody = ''
         for (const stat of allStats) {
             notifyBody += `账号：${maskEmail(stat.email)}\n`
-            notifyBody += `初始积分: ${stat.initialPoints}\n`
-            notifyBody += `获得积分: ${stat.collectedPoints}\n`
-            notifyBody += `最终积分: ${stat.finalPoints}\n`
+            notifyBody += `状态: ${stat.flowCompleted ? (stat.partial ? '流程结束（存在待确认/异常）' : '流程结束') : '流程失败'}\n`
+            notifyBody += `初始积分: ${displayPoints(stat.initialPoints)}\n`
+            notifyBody += `获得积分: ${displayPoints(stat.collectedPoints)}\n`
+            notifyBody += `最终积分: ${displayPoints(stat.finalPoints)}\n`
+            if (Number.isInteger(stat.taskWarningCount) && stat.taskWarningCount >= 0) {
+                notifyBody += `待确认/警告: ${stat.taskWarningCount}\n`
+            }
+            if (Number.isInteger(stat.taskErrorCount) && stat.taskErrorCount >= 0) {
+                notifyBody += `任务错误: ${stat.taskErrorCount}\n`
+            }
             if (stat.error) {
                 notifyBody += `错误: ${stat.error}\n`
             }
@@ -5016,22 +5535,32 @@ async function main() {
 
         const notifyTitle = '微软积分奖励推送通知'
 
-        // 尝试加载同目录下的 sendNotify 脚本（优先 .js，其次 .txt）
+        // 兼容青龙脚本子目录和共享依赖目录，只使用首个有效模块发送一次。
         let sendNotifyModule = null
-        const notifyPaths = [
+        const notifyPaths = [...new Set([
             path.join(__dirname, 'sendNotify.js'),
-            path.join(__dirname, 'sendNotify.txt')
-        ]
+            path.join(__dirname, 'sendNotify.txt'),
+            path.resolve(__dirname, '..', 'sendNotify.js'),
+            path.resolve(__dirname, '..', 'sendNotify.txt'),
+            path.resolve(__dirname, '..', '..', 'sendNotify.js'),
+            path.resolve(__dirname, '..', '..', 'sendNotify.txt'),
+            '/ql/data/scripts/sendNotify.js',
+            '/ql/data/deps/sendNotify.js'
+        ])]
 
         for (const notifyPath of notifyPaths) {
             try {
                 if (fs.existsSync(notifyPath)) {
-                    sendNotifyModule = require(notifyPath)
-                    mainLogger.info('MAIN', `已加载 sendNotify 模块: ${notifyPath}`)
-                    break
+                    const candidate = require(notifyPath)
+                    if (candidate && typeof candidate.sendNotify === 'function') {
+                        sendNotifyModule = candidate
+                        mainLogger.info('MAIN', `已加载 sendNotify 模块: ${notifyPath}`)
+                        break
+                    }
+                    mainLogger.warn('MAIN', `sendNotify 模块缺少可用的发送函数: ${notifyPath}`)
                 }
             } catch (loadError) {
-                mainLogger.warn('MAIN', `加载 sendNotify 失败 (${notifyPath}): ${loadError.message}`)
+                mainLogger.warn('MAIN', `加载 sendNotify 失败 (${notifyPath}): ${formatError(loadError)}`)
             }
         }
 
@@ -5039,11 +5568,11 @@ async function main() {
             await sendNotifyModule.sendNotify(notifyTitle, notifyBody)
             mainLogger.info('MAIN', '推送通知发送完成')
         } else {
-            mainLogger.warn('MAIN', '未找到可用的 sendNotify 模块，跳过推送通知。请确保同目录下存在 sendNotify.js 或 sendNotify.txt 文件。')
+            mainLogger.warn('MAIN', '未找到可用的 sendNotify 模块，跳过推送通知。已检查脚本目录、父目录和青龙共享目录。')
             mainLogger.info('MAIN', `推送内容预览:\n${notifyBody}`)
         }
     } catch (notifyError) {
-        mainLogger.error('MAIN', `推送通知执行失败: ${notifyError.message}`)
+        mainLogger.error('MAIN', `推送通知执行失败: ${formatError(notifyError)}`)
     }
 
     process.exit(0)
@@ -5063,7 +5592,7 @@ process.on('SIGTERM', () => {
 })
 
 process.on('uncaughtException', error => {
-    console.error(`${COLORS.red}[UNCAUGHT] ${error.stack || error.message}${COLORS.reset}`)
+    console.error(`${COLORS.red}[UNCAUGHT] ${formatError(error)}${COLORS.reset}`)
     process.exit(1)
 })
 
@@ -5075,18 +5604,18 @@ process.on('unhandledRejection', (reason, promise) => {
 // 配置区域 - 请在此填写你的账户信息
 // ============================================================================
 const CONFIG = {
-    // 账户列表
-    // 请将下面的示例替换为你自己的微软账户信息
-    // 如果同目录下存在 accounts.json 文件，将优先使用该文件
+    // 账户列表：将下面的占位符替换为你自己的微软账户信息。
+    // 如果同目录下存在 accounts.json 文件，将优先使用该文件。
+    // 多账号：复制整个账户对象，在 accounts 数组中用英文逗号分隔。
     accounts: [
         {
-            email: 'XXXXXX',
-            password: 'XXXXXXX',
-            totpSecret: '', // 如果启用了 TOTP 两步验证，填写密钥
-            geoLocale: 'cn', // 'auto' 自动检测，或指定如 'us', 'cn', 'uk'
+            email: 'XXXXXX',             // 微软账户邮箱
+            password: 'XXXXXXX',         // 微软账户密码
+            totpSecret: '',              // 使用 TOTP 两步验证时填写密钥，否则留空
+            geoLocale: 'cn',             // 'auto' 自动检测，或指定 'us'、'cn'、'uk' 等
             langCode: 'en',
             proxy: {
-                url: '', // 代理地址，如 'http://proxy.example.com' 或 'socks5://127.0.0.1'
+                url: '',                // 不使用代理时留空；例如 'http://proxy.example.com'
                 port: 0,
                 username: '',
                 password: ''
@@ -5095,10 +5624,7 @@ const CONFIG = {
     ]
 }
 
-// ============================================================================
-// 启动脚本
-// ============================================================================
 main().catch(error => {
-    console.error(`${COLORS.red}[FATAL] ${error.stack || error.message}${COLORS.reset}`)
+    console.error(`${COLORS.red}[FATAL] ${formatError(error)}${COLORS.reset}`)
     process.exit(1)
 })
