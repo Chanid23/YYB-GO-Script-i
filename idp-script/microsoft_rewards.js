@@ -4,7 +4,7 @@
 
 /**
  * Microsoft Rewards Standalone Script
- * 修订：2026-10-20 v2（任务异常历史、搜索状态、接口响应校验与统计）
+ * 修订：2026-10-22（简化账号配置、面板会话恢复及失败状态修正）
  *
  * 一个可在 Node.js 环境下直接运行的微软奖励自动化脚本。
  * 基于对 Microsoft-Rewards-Script (https://github.com/TheNetsky/Microsoft-Rewards-Script)
@@ -20,23 +20,20 @@
  *   npm install playwright axios
  *   npx playwright install chromium
  *
- * 使用方法：
- *   1. 在脚本底部 CONFIG 区域填写账户信息，或创建同目录 accounts.json
- *   2. node microsoft-rewards-standalone.js
- *   3. 可选参数：--headless / --no-headless 覆盖无头模式
+ * 使用方法（青龙）：
+ *   1. 新增并启用环境变量 MS_REWARDS_ACCOUNTS，只建一条同名变量。
+ *   2. 格式：账号#密码#二次验证密钥；未设置二次验证可写：账号#密码。
+ *      your_account@example.com#your_password
+ *      another_account@example.com#your_password#YOUR_TOTP_SECRET
+ *   3. 多账号每行一条，不用填写 JSON。第三项填写 TOTP 密钥，不是动态验证码。
+ *   4. 密码含 # 时写成 \#；密码中的反斜杠可写成 \\。
+ *   5. 地区固定 cn、语言固定 en、不使用代理；参数见 ACCOUNT_SETTINGS。
+ *   6. 运行 microsoft_rewards.js；只检查配置加 --check-config（不登录、不执行任务）。
  *
- * 使用方法：
- *   1. 在脚本底部 CONFIG 区域填写账户信息，或创建同目录 accounts.json
- *   2. node microsoft-rewards-standalone.js
- *   3. 可选参数：--headless / --no-headless 覆盖无头模式
- *
- * 使用方法：
- *   1. 在脚本底部 CONFIG 区域填写账户信息，或创建同目录 accounts.json
- *   2. node microsoft-rewards-standalone.js
- *   3. 可选参数：--headless / --no-headless 覆盖无头模式
- *
- * 配置说明：
- *   见脚本底部 CONFIG 对象和 createDefaultConfig() 函数。
+ * 环境变量优先于同目录 accounts.json；兼容旧 JSON 账号格式。
+ * 地区、语言及代理等账号参数统一使用脚本中的固定值。
+ * 环境变量存在但格式有误时直接停止，错误日志不回显账户字段值。
+ * 其他运行参数保留原有脚本默认值及 config.json 支持。
  *
  * 免责声明：
  *   本脚本仅供学习和研究用途。使用本脚本可能违反微软服务条款，
@@ -464,13 +461,93 @@ function loadAccountsFile(filePath) {
             const raw = fs.readFileSync(filePath, 'utf-8')
             const data = JSON.parse(raw)
             if (Array.isArray(data)) return data
-            if (data.accounts && Array.isArray(data.accounts)) return data.accounts
+            if (data && data.accounts && Array.isArray(data.accounts)) return data.accounts
         }
     } catch (error) {
-        console.error(`加载账户文件失败 ${filePath}: ${formatError(error)}`)
+        throw new Error('accounts.json 读取或 JSON 格式错误，请检查账户配置文件')
     }
     return null
 }
+
+// 账户的其他参数固定在脚本中，环境变量只填写邮箱、密码及可选的 TOTP 密钥。
+const ACCOUNT_SETTINGS = Object.freeze({
+    geoLocale: 'cn',
+    langCode: 'en',
+    proxy: Object.freeze({ url: '', port: 0, username: '', password: '' })
+})
+
+function validateAccountConfiguration(accounts, source) {
+    if (!Array.isArray(accounts) || accounts.length === 0) {
+        throw new Error(`${source} 必须包含至少一个账户`)
+    }
+    return accounts.map((account, index) => {
+        const fail = message => { throw new Error(`${source} 第 ${index + 1} 个账户配置无效：${message}`) }
+        if (!account || typeof account !== 'object' || Array.isArray(account)) fail('账户信息无效')
+        if (typeof account.email !== 'string' || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(account.email.trim())) fail('账号必须为微软账户邮箱')
+        if (typeof account.password !== 'string' || account.password.length === 0) fail('密码不能为空')
+        if (account.totpSecret !== undefined && typeof account.totpSecret !== 'string') fail('二次验证密钥必须为字符串')
+        return {
+            email: account.email.trim(),
+            password: account.password,
+            totpSecret: (account.totpSecret || '').trim(),
+            geoLocale: ACCOUNT_SETTINGS.geoLocale,
+            langCode: ACCOUNT_SETTINGS.langCode,
+            proxy: { ...ACCOUNT_SETTINGS.proxy }
+        }
+    })
+}
+
+// 支持密码中的 \# 和 \\；其他反斜杠按原样保留。
+function splitAccountLine(line) {
+    const fields = ['']
+    for (let i = 0; i < line.length; i++) {
+        const character = line[i]
+        if (character === '\\' && (line[i + 1] === '#' || line[i + 1] === '\\')) {
+            fields[fields.length - 1] += line[++i]
+        } else if (character === '#') {
+            fields.push('')
+        } else {
+            fields[fields.length - 1] += character
+        }
+    }
+    return fields
+}
+
+function loadAccountsFromEnvironment(env = process.env) {
+    const raw = env.MS_REWARDS_ACCOUNTS
+    if (raw === undefined) return null
+    if (typeof raw !== 'string' || !raw.trim()) {
+        throw new Error('MS_REWARDS_ACCOUNTS 为空，请填写：账号#密码#二次验证密钥（可省略），多账号每行一条')
+    }
+    // 兼容之前的 JSON 账号配置；地区、语言及代理仍使用上方固定参数。
+    if (/^[\[{]/.test(raw.trim())) {
+        let data
+        try { data = JSON.parse(raw) } catch {
+            throw new Error('MS_REWARDS_ACCOUNTS 的旧 JSON 配置无效；建议改为每行：账号#密码#二次验证密钥（可省略）')
+        }
+        const accounts = Array.isArray(data) ? data : data && Object.prototype.hasOwnProperty.call(data, 'accounts') ? data.accounts : [data]
+        return validateAccountConfiguration(accounts, 'MS_REWARDS_ACCOUNTS')
+    }
+    const accounts = []
+    for (const [index, line] of raw.split(/\r\n|\n|\r/).entries()) {
+        if (!line.trim()) continue
+        const fields = splitAccountLine(line)
+        if (fields.length < 2 || fields.length > 3) {
+            throw new Error(`MS_REWARDS_ACCOUNTS 第 ${index + 1} 行格式无效，请使用：账号#密码#二次验证密钥（可省略）；密码含 # 时写成 \\#`)
+        }
+        accounts.push({ email: fields[0], password: fields[1], totpSecret: fields[2] || '' })
+    }
+    return validateAccountConfiguration(accounts, 'MS_REWARDS_ACCOUNTS')
+}
+
+function loadAccountConfiguration(accountsFile = path.join(__dirname, 'accounts.json'), env = process.env) {
+    const accounts = loadAccountsFromEnvironment(env)
+    if (accounts !== null) return accounts
+    const fromFile = loadAccountsFile(accountsFile)
+    if (fromFile !== null) return validateAccountConfiguration(fromFile, 'accounts.json')
+    throw new Error('未找到账户配置，请在青龙环境变量中新增并启用 MS_REWARDS_ACCOUNTS，值为：账号#密码#二次验证密钥（可省略），多账号每行一条')
+}
+
 
 // ============================================================================
 // HTTP 客户端（带重试和代理）
@@ -658,7 +735,25 @@ class SessionManager {
         }
     }
 
-    buildCookieHeader(cookies, allowedDomains) {
+    cookiesForUrl(cookies, requestUrl) {
+        const url = new URL(requestUrl)
+        const host = url.hostname.toLowerCase()
+        const now = Date.now() / 1000
+        return (cookies || []).filter(cookie => {
+            if (!cookie || typeof cookie.domain !== 'string') return false
+            const domain = cookie.domain.toLowerCase()
+            const normalized = domain.replace(/^\./, '')
+            const matchesDomain = domain.startsWith('.') ? host === normalized || host.endsWith('.' + normalized) : host === normalized
+            if (!matchesDomain || (cookie.secure && url.protocol !== 'https:')) return false
+            if (Number.isFinite(cookie.expires) && cookie.expires > 0 && cookie.expires <= now) return false
+            const cookiePath = cookie.path || '/'
+            if (url.pathname !== cookiePath && !(url.pathname.startsWith(cookiePath) && (cookiePath.endsWith('/') || url.pathname[cookiePath.length] === '/'))) return false
+            return true
+        }).sort((a, b) => (b.path || '/').length - (a.path || '/').length || b.domain.replace(/^\./, '').length - a.domain.replace(/^\./, '').length)
+    }
+
+    buildCookieHeader(cookies, allowedDomains, requestUrl) {
+        if (requestUrl) cookies = this.cookiesForUrl(cookies, requestUrl)
         const filtered = cookies.filter(c => {
             if (!allowedDomains || allowedDomains.length === 0) return true
             return (
@@ -666,7 +761,11 @@ class SessionManager {
                 allowedDomains.some(d => c.domain.toLowerCase().endsWith(d.toLowerCase()))
             )
         })
-        const unique = [...new Map(filtered.map(c => [c.name, c])).values()]
+        // 指定 URL 时优先保留路径/域最具体的 Cookie；旧调用保留原有行为。
+        const unique = requestUrl ? [...filtered.reduce((map, cookie) => {
+            if (!map.has(cookie.name)) map.set(cookie.name, cookie)
+            return map
+        }, new Map()).values()] : [...new Map(filtered.map(c => [c.name, c])).values()]
         // 剔除与 rewards 接口无关的登录/SSO 流程与遥测 cookie。
         // OParams*/esctx-*/IPT/WLSSC 等只在登录跳转时使用，且会随登录次数不断累积
         // （实测可达 20KB+），全部拼进 Cookie 头会把请求头撑过服务端上限，
@@ -2183,52 +2282,112 @@ class RewardsManager {
         return dashboard
     }
 
+    setActivePage(page, isMobile) {
+        this._activePage = page
+        this._activeIsMobile = isMobile
+        this._dashboardCache = null
+    }
+
+    async _dashboardHeaders(url) {
+        let cookies = this._activeIsMobile === false && this.bot.desktopCookies?.length ? this.bot.desktopCookies : this.bot.cookies
+        const page = this._activePage
+        if (page && !page.isClosed()) {
+            cookies = await page.context().cookies(url)
+        }
+        const headers = { ...(this._activeIsMobile === false ? FINGERPRINT_HEADERS_DESKTOP : generateMobileFingerprintHeaders()) }
+        delete headers.cookie
+        delete headers.Cookie
+        headers.Cookie = this.bot.sessionManager.buildCookieHeader(cookies, COMMON_COOKIE_DOMAINS, url)
+        headers.Referer = new URL(url).origin + '/'
+        headers.Origin = new URL(url).origin
+        headers.Accept = 'application/json'
+        return headers
+    }
+
+    async _browserDashboard(url) {
+        const page = this._activePage
+        if (!page || page.isClosed()) return null
+        // 只发 GET，使用当前浏览器的 Cookie jar，不复制跨域 Cookie 或重新提交任务。
+        const response = await page.context().request.get(url, { timeout: 20000 })
+        try {
+            if (!response.ok()) throw new Error(`浏览器面板读取失败 HTTP ${response.status()}`)
+            const actual = new URL(response.url())
+            const requested = new URL(url)
+            if (actual.origin !== requested.origin || actual.pathname !== requested.pathname) {
+                throw new Error('浏览器面板请求跳转，Rewards 会话尚未通过验证')
+            }
+            let data
+            try { data = await response.json() } catch { throw new Error('浏览器面板未返回 JSON 账户数据') }
+            const liveCookies = await page.context().cookies()
+            if (this._activeIsMobile === false) this.bot.desktopCookies = liveCookies
+            else this.bot.cookies = liveCookies
+            return data
+        } finally {
+            await response.dispose().catch(() => {})
+        }
+    }
+
     async getDashboardData(options = {}) {
         const fresh = options.fresh === true
         const allowStale = options.allowStale !== false
-        const now = Date.now()
-        if (!fresh && this._dashboardCache && now - this._dashboardCacheTime < 30000) return this._dashboardCache
-        const cookies = this._activeIsMobile === false && this.bot.desktopCookies?.length ? this.bot.desktopCookies : this.bot.cookies
-        const cookieHeader = this.bot.sessionManager.buildCookieHeader(cookies, COMMON_COOKIE_DOMAINS)
-        const headers = { ...(this._activeIsMobile === false ? FINGERPRINT_HEADERS_DESKTOP : generateMobileFingerprintHeaders()), Cookie: cookieHeader,
-            Referer: 'https://rewards.bing.com/', Origin: 'https://rewards.bing.com' }
-        let lastError
+        if (!fresh && this._dashboardCache && Date.now() - this._dashboardCacheTime < 30000) return this._dashboardCache
+        const primaryUrl = URLS.rewards.userInfoApi + '?type=1'
+        const flyoutUrl = 'https://www.bing.com/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards'
+        const errors = new Map()
+        const record = (source, error) => {
+            const message = formatError(error)
+            // 官方账户限制必须立即停止，不能通过备用接口绕过。
+            if (/官方返回账户限制/.test(message)) throw error
+            errors.set(source, message)
+            this.logger.warn('DASHBOARD', `${source}读取失败 | ${message}`)
+        }
+        const storePrimary = (data, source) => {
+            const dashboard = data?.dashboard ?? (data?.userStatus ? data : null)
+            if (!dashboard) throw new Error('API response has no dashboard')
+            return this._storeDashboard(dashboard, source)
+        }
         for (let attempt = 1; attempt <= 2; attempt++) {
             try {
-                const response = await this.bot.httpClient.request({
-                    url: URLS.rewards.userInfoApi + '?type=1', method: 'GET', headers,
-                    'axios-retry': { retries: 0 }
-                })
-                const dashboard = response.data?.dashboard ?? (response.data?.userStatus ? response.data : null)
-                if (!dashboard) throw new Error('API response has no dashboard')
-                return this._storeDashboard(dashboard, 'rewards-api')
+                const response = await this.bot.httpClient.request({ url: primaryUrl, method: 'GET',
+                    headers: await this._dashboardHeaders(primaryUrl), timeout: 20000, 'axios-retry': { retries: 0 } })
+                return storePrimary(response.data, 'rewards-api')
             } catch (error) {
-                lastError = error
-                if (/官方返回账户限制/.test(String(formatError(error)))) throw error
-                this.logger.debug('DASHBOARD', `主面板读取失败 ${attempt}/2 | ${formatError(error)}`)
+                record('主面板', error)
                 if (attempt === 1) await wait(1000)
             }
         }
         try {
-            const response = await this.bot.httpClient.request({
-                url: 'https://www.bing.com/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards',
-                method: 'GET', headers: { ...headers, Referer: 'https://www.bing.com/', Origin: 'https://www.bing.com' },
-                'axios-retry': { retries: 0 }
-            })
-            const result = this._storeDashboard(this._mapFlyout(response.data), 'bing-flyout', true)
+            const data = await this._browserDashboard(primaryUrl)
+            if (data !== null) {
+                const dashboard = storePrimary(data, 'browser-rewards-api')
+                this.logger.info('DASHBOARD', '已通过当前浏览器会话恢复完整面板')
+                return dashboard
+            }
+        } catch (error) { record('浏览器主面板', error) }
+        try {
+            const response = await this.bot.httpClient.request({ url: flyoutUrl, method: 'GET',
+                headers: await this._dashboardHeaders(flyoutUrl), timeout: 20000, 'axios-retry': { retries: 0 } })
+            const dashboard = this._storeDashboard(this._mapFlyout(response.data), 'bing-flyout', true)
             this.logger.warn('DASHBOARD', '主面板暂不可用，使用部分 Bing 面板；缺失任务状态不视为已完成')
-            return result
-        } catch (error) {
-            lastError = error
-            if (/官方返回账户限制/.test(String(formatError(error)))) throw error
-        }
+            return dashboard
+        } catch (error) { record('Bing 备用面板', error) }
+        try {
+            const data = await this._browserDashboard(flyoutUrl)
+            if (data !== null) {
+                const dashboard = this._storeDashboard(this._mapFlyout(data), 'browser-bing-flyout', true)
+                this.logger.warn('DASHBOARD', '通过浏览器读取部分 Bing 面板；缺失任务状态不视为已完成')
+                return dashboard
+            }
+        } catch (error) { record('浏览器 Bing 备用面板', error) }
+        const details = [...errors].map(([source, message]) => `${source}: ${message}`).join(' | ')
         if (allowStale && this._dashboardCache) {
             this.dashboardMeta = { ...this.dashboardMeta, stale: true }
-            this.logger.warn('DASHBOARD', `读取失败，仅提供旧任务快照；不能用于到账确认 | ${formatError(lastError)}`)
+            this.logger.warn('DASHBOARD', `读取失败，仅提供旧任务快照；不能用于到账确认 | ${details}`)
             return this._dashboardCache
         }
-        throw new Error(`无法取得新鲜面板数据 | ${formatError(lastError)}`)
+        throw new Error(`无法取得新鲜面板数据 | ${details}`)
     }
+
 
     /**
      * 获取面板浮出数据
@@ -5019,6 +5178,7 @@ class MicrosoftRewardsBot {
             }
 
             const mobilePage = await mobileContext.newPage()
+            this.rewards.setActivePage(mobilePage, true)
 
             //
             await this.referrals.beforeLogin(mobilePage)
@@ -5034,6 +5194,10 @@ class MicrosoftRewardsBot {
             } catch (error) {
                 this.logger.warn('FLOW', `获取访问令牌失败: ${formatError(error)}`)
             }
+
+            // OAuth 导航可能更新 Cookie，面板读取使用当前浏览器会话。
+            this.cookies = await mobileContext.cookies()
+            await this.sessionManager.saveCookies(accountEmail, true, this.cookies)
 
             // 获取仪表盘数据
             this.logger.info('FLOW', '获取仪表盘数据')
@@ -5191,6 +5355,7 @@ class MicrosoftRewardsBot {
                 }
 
                 const desktopPage = await desktopContext.newPage()
+                this.rewards.setActivePage(desktopPage, false)
 
                 // 桌面端登录（若已通过共享 cookies 认证，login 会立即检测到 LOGGED_IN 状态）
                 this.logger.info('FLOW', '桌面端登录')
@@ -5367,9 +5532,6 @@ function fatal(message) {
 // 主入口
 // ============================================================================
 async function main() {
-    // 加载依赖
-    loadDependencies()
-
     // 解析命令行参数
     const args = process.argv.slice(2)
     const headlessFlag = args.includes('--headless')
@@ -5393,23 +5555,16 @@ async function main() {
     if (headlessFlag) config.headless = true
     if (noHeadlessFlag) config.headless = false
 
-    // 加载账户
-    let accounts = loadAccountsFile(path.join(__dirname, 'accounts.json'))
-    if (!accounts) {
-        // 使用脚本内嵌的示例账户（需用户填写）
-        accounts = CONFIG.accounts
+    // 环境变量优先；账号信息不再嵌入订阅脚本。
+    const accounts = loadAccountConfiguration()
+    if (args.includes('--check-config')) {
+        const source = process.env.MS_REWARDS_ACCOUNTS !== undefined ? '环境变量 MS_REWARDS_ACCOUNTS' : 'accounts.json'
+        console.log(`[CONFIG] 配置检查通过 | 账户数: ${accounts.length} | 来源: ${source}`)
+        return
     }
 
-    if (!accounts || accounts.length === 0) {
-        fatal('未找到账户配置。请在脚本底部 CONFIG.accounts 中填写账户信息，或创建 accounts.json 文件。')
-    }
-
-    // 验证账户
-    for (const account of accounts) {
-        if (!account.email || !account.password) {
-            fatal(`账户配置无效：email 和 password 为必填项。问题账户: ${account.email || '(空)'}`)
-        }
-    }
+    // 配置检查通过后才加载浏览器等依赖；自检不会登录或执行积分任务。
+    loadDependencies()
 
     // 创建主日志器
     const mainLogger = new Logger({
@@ -5575,7 +5730,8 @@ async function main() {
         mainLogger.error('MAIN', `推送通知执行失败: ${formatError(notifyError)}`)
     }
 
-    process.exit(0)
+    // 流程失败必须反映在青龙任务状态中；仅有待确认提示不视为流程失败。
+    process.exit(allStats.some(stat => !stat.flowCompleted) ? 1 : 0)
 }
 
 // ============================================================================
@@ -5600,29 +5756,7 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error(`${COLORS.red}[UNHANDLED] ${reason}${COLORS.reset}`)
 })
 
-// ============================================================================
-// 配置区域 - 请在此填写你的账户信息
-// ============================================================================
-const CONFIG = {
-    // 账户列表：将下面的占位符替换为你自己的微软账户信息。
-    // 如果同目录下存在 accounts.json 文件，将优先使用该文件。
-    // 多账号：复制整个账户对象，在 accounts 数组中用英文逗号分隔。
-    accounts: [
-        {
-            email: 'XXXXXX',             // 微软账户邮箱
-            password: 'XXXXXXX',         // 微软账户密码
-            totpSecret: '',              // 使用 TOTP 两步验证时填写密钥，否则留空
-            geoLocale: 'cn',             // 'auto' 自动检测，或指定 'us'、'cn'、'uk' 等
-            langCode: 'en',
-            proxy: {
-                url: '',                // 不使用代理时留空；例如 'http://proxy.example.com'
-                port: 0,
-                username: '',
-                password: ''
-            }
-        }
-    ]
-}
+// 账户配置请填写青龙环境变量 MS_REWARDS_ACCOUNTS，示例及说明见脚本开头。
 
 main().catch(error => {
     console.error(`${COLORS.red}[FATAL] ${formatError(error)}${COLORS.reset}`)

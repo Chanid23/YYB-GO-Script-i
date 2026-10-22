@@ -94,6 +94,23 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 
 各脚本所需环境变量、依赖和定时规则请查看对应文件头部说明。
 
+## 微软积分配置
+
+在青龙中新增并启用一条环境变量 `MS_REWARDS_ACCOUNTS`，多账号每行一条：
+
+```text
+your_account@example.com#your_password
+another_account@example.com#your_password#YOUR_TOTP_SECRET
+```
+
+未设置二次验证时省略第三项；第三项填写 TOTP 密钥，不是动态验证码。密码含 `#` 时写成 `\#`，反斜杠可写成 `\\`。地区固定为 `cn`、语言为 `en`、不使用代理。账号信息无需写入脚本，订阅更新不会覆盖环境变量。
+
+仅检查配置、不登录和不执行积分任务：
+
+```bash
+task lcmovie_YYB-GO-Script-i_main/idp-script/microsoft_rewards.js -- --check-config
+```
+
 ## 注意事项
 
 - 微信登录 code 通常只能使用一次，多个微信任务请错开运行时间。
