@@ -690,8 +690,7 @@ def _manual_pre_report(client: ZhbClient, ttype: int, home: Dict[str, Any]) -> s
             if not union_id:
                 return "缺 unionId，需在微信内真正关注公众号"
             status = client.is_follow_public(union_id)
-            followed = (status.get("data") if isinstance(status.get("data"), (dict, bool))
-                        else status.get("data"))
+            followed = status.get("data")       # true / false / None(查询失败)
             resp = client.pre_follow_public(union_id)
             if str(resp.get("code")) == "200":
                 return (f"已上报 preFollowPublic（服务端关注状态 {followed}），"
