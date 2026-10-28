@@ -74,6 +74,9 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 众安健康签到 | `zajk.py` |
 | JD Cookie同步 | `jd_cookie.py` |
 | 移动云盘（code版） | `ydyp_code.py` |
+| 顺丰速运自动任务 | `sfsy.py` |
+| 影视飓风 | `YSJF.js` |
+| 铛铛一下 | `DDYX.py` |
 
 
 ## 独立脚本
