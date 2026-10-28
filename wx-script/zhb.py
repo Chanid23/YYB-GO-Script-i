@@ -17,10 +17,11 @@ cron: 27 8 * * *
   ZHB_DRY_RUN       可选，=1 只查询签到状态与任务列表，不做任何写操作
   ZHB_ENABLE_SIGN   可选，默认 1；=0 跳过签到
   ZHB_ENABLE_TASK   可选，默认 1；=0 跳过华宝乐园任务
-  ZHB_TASK_TYPES    可选，默认 1,2,6,11；允许自动完成的任务类型（逗号分隔）
+  ZHB_TASK_TYPES    可选，默认 all（全部类型都尝试）；也可用逗号分隔指定，如 1,2,6,11
                     1=浏览产品 2=连续签到 6=订阅通知 11=每日答题
-                    4=添加企微管家 5=关注公众号 需真人操作，服务端不接受脚本标记，
-                    默认不在列表内，可自行加入尝试
+                    4=添加企微管家 5=关注公众号：服务端 completedTask 明确拒绝这两类
+                    （返回「不支持的任务类型」），脚本会先调用其官方「去完成」上报接口
+                    （toComplete / preFollowPublic）再尝试，最终仍需真人扫码/关注
   ZHB_TASK_DELAY    可选，任务之间间隔秒数，默认 1.2（避免请求过于密集）
   ZHB_AUTO_REGISTER 可选，默认 0。=0 时「未注册」的微信账号直接跳过、日志标注未注册；
                     =1 才会走手机号授权通道自动注册（会真的注册新账号，谨慎开启）
@@ -78,6 +79,18 @@ API_COMPLETE_TASK = "/miniprogram/api/huabaopark/v6/completedTask"
 API_RECEIVE_TASK = "/miniprogram/api/huabaopark/v6/receiveTaskIntegral"
 API_SIGN = "/miniprogram/api/integral/v2/sign"
 API_SIGN_INFO = "/miniprogram/api/integral/v2/getSignInfo"
+# 「去完成」上报通道：4=添加企微管家（eventId=1002）
+API_TO_COMPLETE = "/miniprogram/api/integral/v2/toComplete"
+# 关注公众号相关：5=关注公众号（eventId=1001）
+API_PRE_FOLLOW = "/miniprogram/api/v6/CommonLottery/preFollowPublic"
+API_IS_FOLLOW = "/miniprogram/api/v6/common/isFollowPublic"
+# 管家绑定关系查询
+API_MANAGER_INFO = "/miniprogram/api/userinfo/v3/managerInfo/get"
+
+# 每日答题题库（小程序把题库放静态 OSS，题目与正确答案都在里面）
+QUIZ_BANK_URL = ("https://static-cdn.property.cic.cn/prod-platform-lamp/common/fe-assets/"
+                 "2025-08/14c08f48-568b-4dd2-b7ff-aca2250342c7.json")
+QUIZ_EPOCH = datetime(2025, 10, 10)   # 题库起始日，索引 = (today - QUIZ_EPOCH).days % 题量
 
 # 签名密钥（复现小程序 utils/secretutil/getSecretKey.js 的静态算法）
 _SCRM_E1 = "00031006001313361013031210021302001210121116"
@@ -103,16 +116,19 @@ AUTO_REGISTER = os.getenv("ZHB_AUTO_REGISTER", "0").strip().lower() in ("1", "tr
 DEBUG = os.getenv("ZHB_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
 TASK_DELAY = float(os.getenv("ZHB_TASK_DELAY", "1.2") or 1.2)
 
-_DEFAULT_TASK_TYPES = "1,2,6,11"
+_DEFAULT_TASK_TYPES = "all"
 
 
-def parse_task_types() -> set:
-    raw = os.getenv("ZHB_TASK_TYPES", _DEFAULT_TASK_TYPES) or _DEFAULT_TASK_TYPES
+def parse_task_types():
+    """返回允许自动完成的任务类型集合；None 表示「全部尝试」。"""
+    raw = (os.getenv("ZHB_TASK_TYPES", _DEFAULT_TASK_TYPES) or _DEFAULT_TASK_TYPES).strip()
+    if raw.lower() in ("all", "*", "全部", ""):
+        return None
     result = set()
-    for piece in re.split(r"[,，\s]+", raw.strip()):
+    for piece in re.split(r"[,，\s]+", raw):
         if piece.isdigit():
             result.add(int(piece))
-    return result or {1, 2, 6, 11}
+    return result or None
 
 
 TASK_TYPES = parse_task_types()
@@ -340,6 +356,7 @@ class ZhbClient:
 
     def __init__(self) -> None:
         self.token = ""
+        self.union_id = ""      # 小程序从 storage 里取，登录响应里带下来
         self.session = requests.Session()
         self.session.trust_env = False
 
@@ -404,12 +421,115 @@ class ZhbClient:
         return self.request("POST", API_SIGN,
                             body={"description": "签到", "integralDate": today_text(), "type": 0})
 
-    def complete_task(self, task_type: int, point_strategy_id: Any) -> Dict[str, Any]:
-        return self.request("POST", API_COMPLETE_TASK, quiet=True,
-                            body={"integralTaskTypeCd": task_type, "pointStrategyId": point_strategy_id})
+    def complete_task(self, task_type: int, point_strategy_id: Any,
+                      answer_passed: Optional[bool] = None) -> Dict[str, Any]:
+        """上报任务完成。
+
+        第 11 类（每日答题）服务端不校验答案，只需把客户端本地比对的结论
+        answerPassed 一并提交即可；其余类型不带该字段。
+        """
+        body: Dict[str, Any] = {"integralTaskTypeCd": task_type,
+                                "pointStrategyId": point_strategy_id}
+        if answer_passed is not None:
+            body["answerPassed"] = bool(answer_passed)
+        return self.request("POST", API_COMPLETE_TASK, quiet=True, body=body)
 
     def receive_task(self, task_id: Any) -> Dict[str, Any]:
         return self.request("POST", API_RECEIVE_TASK, quiet=True, body={"id": task_id})
+
+    # ---- 4/5 类任务的官方「去完成」上报通道 ---------------------------- #
+    def to_complete(self) -> Dict[str, Any]:
+        """「去完成」埋点上报（eventId=1002，添加企微管家）。
+
+        小程序源码里这条请求不带任何参数，路径就是 /integral/v2/toComplete，
+        带 eventId 反而会让签名路径和客户端不一致，这里严格对齐客户端。
+        """
+        return self.request("GET", API_TO_COMPLETE, quiet=True)
+
+    def pre_follow_public(self, union_id: str) -> Dict[str, Any]:
+        """关注公众号前置上报。"""
+        return self.request("GET", API_PRE_FOLLOW, params={"unionId": union_id}, quiet=True)
+
+    def is_follow_public(self, union_id: str) -> Dict[str, Any]:
+        """查询公众号关注状态（服务端真实状态，用于判定任务能否完成）。"""
+        return self.request("GET", API_IS_FOLLOW, params={"unionId": union_id}, quiet=True)
+
+    def manager_info(self, id_card_no: str) -> Dict[str, Any]:
+        """查询专属管家绑定关系；已绑定才可能完成任务 4。"""
+        return self.request("GET", API_MANAGER_INFO, params={"IDCardNo": id_card_no}, quiet=True)
+
+
+# --------------------------------------------------------------------------- #
+# 每日答题：题库是公开静态 JSON，题目与正确答案都写在里面
+# --------------------------------------------------------------------------- #
+_QUIZ_CACHE: Optional[List[Dict[str, Any]]] = None
+
+
+def load_quiz_bank() -> List[Dict[str, Any]]:
+    """拉取题库（带进程内缓存）。失败返回空列表，调用方降级处理。"""
+    global _QUIZ_CACHE
+    if _QUIZ_CACHE is not None:
+        return _QUIZ_CACHE
+    try:
+        resp = requests.get(QUIZ_BANK_URL, timeout=ZHB_TIMEOUT,
+                            headers={"User-Agent": pick_user_agent()})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        print(f"    ⚠️ 题库拉取失败（不影响答题，直接按通过上报）：{preview(exc, 100)}")
+        _QUIZ_CACHE = []
+        return _QUIZ_CACHE
+
+    items = data if isinstance(data, list) else None
+    if items is None and isinstance(data, dict):
+        for key in ("data", "list", "questions", "result"):
+            if isinstance(data.get(key), list):
+                items = data[key]
+                break
+    _QUIZ_CACHE = [x for x in (items or []) if isinstance(x, dict)]
+    return _QUIZ_CACHE
+
+
+def today_quiz() -> Dict[str, Any]:
+    """算出今天轮到的题目与正确答案。
+
+    索引口径与小程序一致：题目按日轮换，(今天 - 起始日) 的天数对题量取模。
+    题库实测结构（90 题，根节点就是数组）：
+      {questionId, question, questionAnalysis,
+       options:[{optionId, optionName, optionEnum}], correctAnswerId:[optionId]}
+    """
+    bank = load_quiz_bank()
+    if not bank:
+        return {}
+    index = (datetime.now().date() - QUIZ_EPOCH.date()).days % len(bank)
+    quiz = bank[index]
+    options = quiz.get("options") or quiz.get("answerList") or []
+    raw_correct = quiz.get("correctAnswerId")
+    if isinstance(raw_correct, (list, tuple)):
+        correct_ids = [str(x) for x in raw_correct]
+    elif raw_correct in (None, ""):
+        correct_ids = []
+    else:
+        correct_ids = [str(raw_correct)]
+
+    correct_texts: List[str] = []
+    option_texts: List[str] = []
+    for opt in options:
+        oid = str(opt.get("optionId") or opt.get("id") or "")
+        text = str(opt.get("optionName") or opt.get("content") or "")
+        option_texts.append(text)
+        if oid in correct_ids:
+            correct_texts.append(text)
+
+    return {
+        "index": index,
+        "total": len(bank),
+        "question": str(quiz.get("question") or quiz.get("content") or ""),
+        "correct_id": ",".join(correct_ids),
+        "correct_text": "、".join(correct_texts),
+        "options": option_texts,
+    }
+
 
 
 # --------------------------------------------------------------------------- #
@@ -476,6 +596,9 @@ def login_account(account: AccountTarget, client: ZhbClient) -> Tuple[str, str]:
 
     phone = mask_phone(data.get("phone")) if data.get("phone") else ""
     name = keep_name(data.get("idName"))
+    # 关注公众号要 unionId：客户端是从 storage 取的，登录响应里就带着
+    client.union_id = str(data.get("unionId") or data.get("unionid")
+                          or data.get("union_id") or client.union_id or "")
     if phone or name:
         account.label_suffix = " ".join(x for x in (phone, name) if x)
     return LOGIN_OK, phone or "已登录"
@@ -526,11 +649,57 @@ def _task_brief(task: Dict[str, Any]) -> str:
 
 # 服务端因「未实名」拦下任务时的返回文案（各地风控措辞略有差异，做包含匹配）
 _REALNAME_HINTS = ("实名", "认证", "身份证", "身份信息")
+# 服务端明确表示「这类任务不走这个接口」的文案 → 归入需真人，不算失败
+_UNSUPPORTED_HINTS = ("不支持的任务类型", "任务类型不存在", "不支持")
 
 
 def _is_realname_block(msg: Any) -> bool:
     text = str(msg or "")
     return any(hint in text for hint in _REALNAME_HINTS)
+
+
+def _is_unsupported(msg: Any) -> bool:
+    text = str(msg or "")
+    return any(hint in text for hint in _UNSUPPORTED_HINTS)
+
+
+def _ctx_value(home: Dict[str, Any], *keys: str) -> str:
+    """从首页数据里挖出 unionId / 身份证号等上下文值。"""
+    for key in keys:
+        value = deep_first(home, key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _manual_pre_report(client: ZhbClient, ttype: int, home: Dict[str, Any]) -> str:
+    """类型 4/5 的官方「去完成」上报。
+
+    小程序里点任务按钮就是走这两个接口，服务端据此记录动作；
+    但真正判定「已完成」还依赖企微侧绑定回写 / 公众号关注状态回查，
+    所以这里只做上报，能过就过，过不了交给 completedTask 的结论。
+    """
+    try:
+        if ttype == 4:
+            resp = client.to_complete()
+            if str(resp.get("code")) == "200":
+                return "已上报 toComplete，需在微信内扫码加企微后由服务端回写才算完成"
+            return f"toComplete 返回 {resp.get('msg') or resp.get('code')}，需真人扫码加企微"
+        if ttype == 5:
+            union_id = client.union_id or _ctx_value(home, "unionId", "unionid")
+            if not union_id:
+                return "缺 unionId，需在微信内真正关注公众号"
+            status = client.is_follow_public(union_id)
+            followed = (status.get("data") if isinstance(status.get("data"), (dict, bool))
+                        else status.get("data"))
+            resp = client.pre_follow_public(union_id)
+            if str(resp.get("code")) == "200":
+                return (f"已上报 preFollowPublic（服务端关注状态 {followed}），"
+                        f"需在微信内真正关注公众号后回查才会变更")
+            return f"preFollowPublic 返回 {resp.get('msg') or resp.get('code')}，需真人关注公众号"
+    except Exception as exc:
+        return f"上报异常：{preview(exc, 100)}"
+    return ""
 
 
 def run_tasks(client: ZhbClient, home: Dict[str, Any]) -> Dict[str, Any]:
@@ -541,7 +710,7 @@ def run_tasks(client: ZhbClient, home: Dict[str, Any]) -> Dict[str, Any]:
       failed           服务端拒绝执行的任务（含被「未实名」拦下的）
       realname_blocked 其中因未实名被拦下的数量
       already_done     今天此前已完成/已领取、本次无需再动的任务
-      unsupported      需真人操作 / 不在白名单里的任务
+      unsupported      需真人操作 / 服务端不支持脚本完成的任务
       received         成功领取积分的任务；gained = 本次领到的积分数
       integral_before / integral_after  任务前后的积分基数与结果
     """
@@ -557,8 +726,22 @@ def run_tasks(client: ZhbClient, home: Dict[str, Any]) -> Dict[str, Any]:
         result["skipped"].append("已关闭任务模块（ZHB_ENABLE_TASK=0）")
         return result
 
-    def mark_failed(task: Dict[str, Any], resp: Dict[str, Any]) -> None:
+    def allowed(ttype: Any) -> bool:
+        """TASK_TYPES 为 None 表示全部类型都尝试。"""
+        return TASK_TYPES is None or ttype in TASK_TYPES
+
+    def mark_failed(task: Dict[str, Any], resp: Dict[str, Any], note: str = "") -> None:
         msg = str(resp.get("msg") or resp.get("_error") or preview(resp, 80) or "未知原因")
+        if _is_unsupported(msg):
+            # 服务端明确说这类任务不走 completedTask → 不是失败，是需要真人
+            result["unsupported"].append({
+                "name": _task_brief(task),
+                "reason": msg,
+                "note": note or "服务端不支持脚本直接完成",
+            })
+            return
+        if note:
+            msg = f"{msg}（{note}）"
         result["failed"].append({"name": _task_brief(task), "reason": msg})
         if _is_realname_block(msg):
             result["realname_blocked"] += 1
@@ -570,12 +753,13 @@ def run_tasks(client: ZhbClient, home: Dict[str, Any]) -> Dict[str, Any]:
                 result["received"].append(f"{_task_brief(task)}（DRY_RUN 未领取）")
                 continue
             resp = client.receive_task(task["id"])
-            if resp.get("code") == "200":
+            if str(resp.get("code")) == "200":
                 result["received"].append(_task_brief(task))
                 result["gained"] += int(task.get("integralNum") or 0)
             time.sleep(TASK_DELAY)
 
-    # 2) 完成未做的任务（仅限白名单类型）
+    # 2) 完成未做的任务
+    quiz_printed = False
     for task in task_list:
         status = task.get("status")
         ttype = task.get("taskType")
@@ -583,20 +767,41 @@ def run_tasks(client: ZhbClient, home: Dict[str, Any]) -> Dict[str, Any]:
             continue                      # 已在第 1 步领取，跳过
         if status != 0:
             # 今天此前就已完成/已领取的任务，计入「今日已完成」
-            if ttype in TASK_TYPES:
+            if status == 3:
                 result["already_done"].append(_task_brief(task))
             continue
-        if ttype not in TASK_TYPES:
-            result["unsupported"].append(_task_brief(task))
+        if not allowed(ttype):
+            result["unsupported"].append({
+                "name": _task_brief(task), "reason": "不在 ZHB_TASK_TYPES 白名单内",
+                "note": "可通过环境变量放开",
+            })
             continue
         if DRY_RUN:
             result["completed"].append(f"{_task_brief(task)}（DRY_RUN 未执行）")
             continue
-        resp = client.complete_task(ttype, task.get("pointStrategyId"))
-        if resp.get("code") == "200":
+
+        # 11=每日答题：题库可算，答案确定，直接按「答对」上报
+        answer_passed: Optional[bool] = None
+        note = ""
+        if ttype == 11:
+            quiz = today_quiz()
+            if quiz:
+                if not quiz_printed:
+                    print(f"       📖 今日题目（题库第 {quiz['index'] + 1}/{quiz['total']} 题）："
+                          f"{quiz['question']}")
+                    print(f"          正确答案：{quiz['correct_text'] or quiz['correct_id']}")
+                    quiz_printed = True
+                answer_passed = True
+            else:
+                answer_passed = True      # 题库拿不到也照常上报通过
+        elif ttype in (4, 5):
+            note = _manual_pre_report(client, ttype, home)
+
+        resp = client.complete_task(ttype, task.get("pointStrategyId"), answer_passed=answer_passed)
+        if str(resp.get("code")) == "200":
             result["completed"].append(_task_brief(task))
         else:
-            mark_failed(task, resp)
+            mark_failed(task, resp, note)
         time.sleep(TASK_DELAY)
 
     # 3) 签到会带出「连续签到 N 天」任务
@@ -604,9 +809,10 @@ def run_tasks(client: ZhbClient, home: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(sign_cont, dict) and sign_cont.get("taskType") and not DRY_RUN:
         done = sign_cont.get("finishNum") or 0
         target = sign_cont.get("targetNum") or 0
-        if sign_cont.get("status") in (0, None) and target and done >= target:
+        if sign_cont.get("status") in (0, None) and target and done >= target \
+                and allowed(sign_cont.get("taskType")):
             resp = client.complete_task(sign_cont.get("taskType"), sign_cont.get("pointStrategyId"))
-            if resp.get("code") == "200":
+            if str(resp.get("code")) == "200":
                 result["completed"].append(_task_brief(sign_cont))
             else:
                 mark_failed(sign_cont, resp)
@@ -618,13 +824,14 @@ def run_tasks(client: ZhbClient, home: Dict[str, Any]) -> Dict[str, Any]:
         for task in home2.get("showTaskList") or []:
             if task.get("status") == 2 and task.get("id"):
                 resp = client.receive_task(task["id"])
-                if resp.get("code") == "200":
+                if str(resp.get("code")) == "200":
                     result["received"].append(_task_brief(task))
                     result["gained"] += int(task.get("integralNum") or 0)
                 time.sleep(TASK_DELAY)
         result["integral_after"] = home2.get("totalIntegral")
 
     return result
+
 
 
 def describe_tasks(task_result: Dict[str, Any]) -> Tuple[str, bool]:
@@ -728,8 +935,8 @@ def run_account(index: int, total: int, account: AccountTarget) -> Dict[str, Any
             print(f"       ❌ 失败 {node['name']}：{node['reason']}")
         for line in task_result["already_done"]:
             print(f"       ✔️ 今日此前已完成 {line}")
-        for line in task_result["unsupported"]:
-            print(f"       ~ 需真人操作 {line}（关注公众号 / 加企微管家等）")
+        for node in task_result["unsupported"]:
+            print(f"       ~ 需真人操作 {node['name']}：{node['note']}")
         for line in task_result["skipped"]:
             print(f"       ⚠️ {line}")
 
@@ -891,7 +1098,7 @@ def main() -> int:
         f"🚫 未注册  : " + ("自动注册（ZHB_AUTO_REGISTER=1，会创建新账号）"
                            if AUTO_REGISTER else "跳过并在日志标注未注册"),
         f"✍️ 签到    : " + ("开启" if ENABLE_SIGN else "关闭（ZHB_ENABLE_SIGN=0）"),
-        f"📋 任务    : " + (f"开启，可自动完成类型 {sorted(TASK_TYPES)}"
+        f"📋 任务    : " + (f"开启，可自动完成类型 {'全部' if TASK_TYPES is None else sorted(TASK_TYPES)}"
                            if ENABLE_TASK else "关闭（ZHB_ENABLE_TASK=0）"),
         f"🔑 签名    : HMAC-SHA256(路径+body+nonce+时间戳+token)，密钥由小程序包静态算法复现",
     ])
