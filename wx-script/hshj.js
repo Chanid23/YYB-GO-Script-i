@@ -7,7 +7,10 @@
 //    YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
 //    WX_ID              可选，仅运行指定ref，格式：ref#备注，多账号换行或 & 分隔
 //    WECHAT_SERVER      可选，旧微信协议服务回退地址
-//    HSJJ_AUTO_CLAIM_H5 设为 '0' 或 'false' 关闭自动提现（默认开启）
+//
+//  说明：2026-10-28 起已移除依赖微信 H5 网页授权的红包自动领取/提现链路
+//  （mktzb baseWxAuth 授权、getCodeBaseInfo、checkCodeBatchRepeat），
+//  仅保留签到、口令兑换、积分与红包记录查询（均为小程序侧接口）。
 
 
 'use strict';
@@ -106,10 +109,6 @@ const WECHAT_SERVER = (process.env.WECHAT_SERVER || '').replace(/\/$/, '');
 const debug = process.env.debug || 0;
 const APPID = 'wx1b44c3ad181bde16';
 const ACTIVITY_PAGE_ID = process.env.HSJJ_ACTIVITY_PAGE_ID || '7541';
-const H5_OAUTH_APPID = 'wx80226ec03be5ab6c';
-const H5_URLTAG = 'cfyh';
-const AUTO_CLAIM_H5_RED_PACKET = process.env.HSJJ_AUTO_CLAIM_H5 !== '0';
-
 const CACHE_DIR = pathMod.join(process.cwd(), '.cache');
 const ACCOUNT_CACHE_FILE = pathMod.join(CACHE_DIR, 'hsjj_accounts.json');
 
@@ -888,16 +887,6 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
     }
     log('  📋 活动: ' + activity.title + ` | status=${activityStatus || '-'}`);
 
-    // 兑换前先补领历史未领取红包（自动提现）
-    let existingClaimResult = { claimed: 0, amount: 0 };
-    if (AUTO_CLAIM_H5_RED_PACKET) {
-        log('  💰 检查历史未领取红包...');
-        existingClaimResult = await claimExistingWatchRewards(session, wxid, cache, cacheKey, activity);
-        if (existingClaimResult.claimed > 0) {
-            log(`  ✅ 历史红包补领完成: ${existingClaimResult.claimed}个, 共${formatMoney(existingClaimResult.amount)}元`);
-        }
-    }
-
     // 从活动内容中提取指数代码
     const skipLink = activity.skipLink || '';
     const codeMatch = skipLink.match(/[?&]code=([^&]+)/i);
@@ -908,7 +897,7 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
     const roeResp = await apiRequest('GET', '/fundex-quote/security/info/queryMustSee', { securityCode, isCapital: false }, token, '', openId, loginData.userId);
     if (roeResp?.code !== '200' || !roeResp?.data?.roe) {
         log('  ⚠️ 查询ROE失败');
-        return { success: false, existingClaim: existingClaimResult };
+        return { success: false };
     }
     const roeValue = roeResp.data.roe.value;
     const roeAnswer = roeValue.toFixed(2) + '%';
@@ -990,44 +979,19 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
             if (isRedPacket) {
                 log('  🎉 兑换成功! 标题: ' + (data.title || roeAnswer) + ' 红包: ' + data.rewardAmount + '元');
 
-                // 自动提现：兑换成功后立即领取新红包
-                let newClaimResult = null;
-                if (AUTO_CLAIM_H5_RED_PACKET) {
-                    const requestId = data.redPacketRequestId || data.requestId || '';
-                    const ticketCode = data.tickCode || data.ticketCode || '';
-                    if (requestId && ticketCode) {
-                        log('  💰 开始自动领取新红包...');
-                        await updateRedPacketGetStatus(token, openId, loginData.userId, {
-                            requestId,
-                            activityId: exchangeActivityId,
-                            activityType: '4',
-                        });
-                        newClaimResult = await claimRedPacket(
-                            token, openId, loginData.userId,
-                            requestId, ticketCode, exchangeActivityId, '4',
-                            '', wxid, cache, cacheKey
-                        );
-                        if (newClaimResult?.success) {
-                            log('  ✅ 新红包自动领取成功: ' + formatMoney(newClaimResult.amount || data.rewardAmount) + '元' + (newClaimResult.message ? ' (' + newClaimResult.message + ')' : ''));
-                        } else {
-                            log('  ⚠️ 新红包自动领取失败: ' + (newClaimResult?.message || '未知'));
-                        }
-                    }
-                }
-
                 return {
                     success: true, type: 'redPacket', amount: Number(data.rewardAmount) || 0, data,
-                    claimResult: newClaimResult, existingClaim: existingClaimResult, activity,
+                    activity,
                 };
             }
             log('  🎉 兑换成功! 标题: ' + (data.title || roeAnswer) + ' 积分: ' + data.rewardAmount);
-            return { success: true, type: 'point', amount: Number(data.rewardAmount) || 0, data, existingClaim: existingClaimResult, activity };
+            return { success: true, type: 'point', amount: Number(data.rewardAmount) || 0, data, activity };
         }
         log('  ⚠️ ' + (data?.content || JSON.stringify(data)));
-        return { success: false, existingClaim: existingClaimResult };
+        return { success: false };
     }
     log('  ⚠️ 提交失败: ' + (resp?.message || JSON.stringify(resp)));
-    return { success: false, existingClaim: existingClaimResult };
+    return { success: false };
 }
 
 // 查询红包活动列表
@@ -1064,198 +1028,6 @@ async function getRequestPage(token, openId, userId) {
         return resp.data.dataList;
     }
     return [];
-}
-
-// 标记红包进入领取流程。抓包显示打开外部 mktzb 页面前会先调用这个接口。
-async function updateRedPacketGetStatus(token, openId, userId, packet) {
-    const payload = {
-        requestId: packet.requestId,
-        activityId: packet.activityId,
-        activityType: packet.activityType || '4',
-    };
-    const resp = await apiRequest('POST', '/fundex-activity/redPacket/updateGetStatus', payload, token, '', openId, userId);
-    if (debug) log('  [updateGetStatus] ' + JSON.stringify(resp).substring(0, 200));
-    return resp?.code === '200';
-}
-
-/**
- * 通过桥接服务获取 H5 公众号 openid（cfyh cookie）。
- * 流程参考 Python resolve_h5_openid：
- * 1) 用 H5_OAUTH_APPID 从桥接服务拿 code
- * 2) 访问 baseWxAuth 授权页，从 Set-Cookie / HTML 提取 cfyh openid
- * 3) 缓存到账号缓存，下次直接复用
- */
-async function resolveH5Openid(wxid, ticketCode, cache, cacheKey) {
-    if (cache && cacheKey) {
-        const cached = getCache(cache, cacheKey);
-        if (cached?.h5Openid) {
-            if (debug) log('  📦 使用缓存H5 openid');
-            return cached.h5Openid;
-        }
-    }
-    if (!wxid || !WECHAT_SERVER || !ticketCode) return '';
-
-    try {
-        // 1. 通过内置 YYB-Go-Enhanced 接口获取 H5 公众号 code
-        const code = await getSingleCode(H5_OAUTH_APPID, String(wxid).split('#')[0].trim());
-        if (!code) {
-            if (debug) log('  ⚠️ 桥接服务未返回H5 code');
-            return '';
-        }
-
-        // 2. 访问 baseWxAuth 授权页，跟随重定向并提取 cfyh cookie
-        const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) UnifiedPCWindowsWechat(0xf254186b) XWEB/19841 miniProgram/' + APPID;
-        const authUrl = `https://www.mktzb.com/mktadmin/wcode/baseWxAuth/${H5_URLTAG}?code=${encodeURIComponent(code)}&state=${encodeURIComponent(ticketCode)}`;
-
-        let h5Openid = '';
-        try {
-            const resp = await axios.get(authUrl, {
-                headers: {
-                    'User-Agent': ua,
-                    'Referer': `https://www.mktzb.com/mktadmin/wcode/baseWxAuth/${H5_URLTAG}?prjCode=${encodeURIComponent(ticketCode)}`,
-                },
-                timeout: 30000,
-                maxRedirects: 5,
-            });
-
-            // 从 Set-Cookie 提取 cfyh
-            const setCookies = resp.headers['set-cookie'];
-            if (setCookies) {
-                const cookies = Array.isArray(setCookies) ? setCookies : [setCookies];
-                for (const c of cookies) {
-                    const m = c.match(new RegExp(`${H5_URLTAG}=([^;]+)`));
-                    if (m) { h5Openid = m[1]; break; }
-                }
-            }
-
-            // 从 HTML 提取 openid
-            if (!h5Openid) {
-                const html = typeof resp.data === 'string' ? resp.data : '';
-                const m = html.match(/id=["']openid["'][^>]*value=["']([^"']*)/i);
-                if (m) h5Openid = m[1];
-            }
-        } catch (e) {
-            if (debug) log('  ⚠️ H5授权请求失败: ' + e.message);
-        }
-
-        if (h5Openid) {
-            if (debug) log('  🔑 H5 openid获取成功: ' + h5Openid.substring(0, 8) + '***');
-            if (cache && cacheKey) {
-                putCache(cache, cacheKey, { h5Openid });
-                saveCache(cache);
-            }
-        }
-        return h5Openid;
-    } catch (e) {
-        if (debug) log('  ⚠️ resolveH5Openid失败: ' + e.message);
-        return '';
-    }
-}
-
-// 领取红包：真正领取流程在外部 mktzb 红包页，不是 fundex 的 exchangeRedPacket。
-// 抓包流程：baseWxAuth 页面 -> getCodeBaseInfo 查看 -> checkCodeBatchRepeat 领取。
-// wxid/cache/cacheKey 用于在 HTML 提取不到 openid 时通过 resolveH5Openid 兜底。
-async function claimRedPacket(token, openId, userId, requestId, ticketCode, activityId, activityType, mktzbOpenId = '', wxid = '', cache = null, cacheKey = '') {
-    const prjCode = ticketCode || requestId;
-    if (!prjCode) return { success: false, message: '缺少ticketCode/prjCode' };
-
-    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) UnifiedPCWindowsWechat(0xf254186b) XWEB/19841 miniProgram/' + APPID;
-    const pageUrl = `https://www.mktzb.com/mktadmin/wcode/baseWxAuth/cfyh?prjCode=${encodeURIComponent(prjCode)}`;
-    const formHeaders = {
-        'User-Agent': ua,
-        'Referer': pageUrl,
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'X-Requested-With': 'XMLHttpRequest',
-    };
-
-    const pageResp = await axios.get(pageUrl, { headers: { 'User-Agent': ua }, timeout: 30000 });
-    const html = String(pageResp.data || '');
-    let pageOpenId = (html.match(/id=["']openid["'][^>]*value=["']([^"']*)/i) || [])[1] || mktzbOpenId || process.env.HSJJ_MKTZB_OPENID || '';
-    const prjUrltag = (html.match(/id=["']prj_urltag["'][^>]*value=["']([^"']*)/i) || [])[1] || H5_URLTAG;
-    const pagePrjCode = (html.match(/id=["']prjCode["'][^>]*value=["']([^"']*)/i) || [])[1] || prjCode;
-
-    // HTML 提取不到 openid 时，通过桥接服务走 H5 OAuth 兜底
-    if (!pageOpenId && wxid && AUTO_CLAIM_H5_RED_PACKET) {
-        log('  🔄 HTML未获取到openid，通过桥接服务解析H5 openid...');
-        pageOpenId = await resolveH5Openid(wxid, prjCode, cache, cacheKey);
-    }
-
-    if (!pageOpenId) {
-        return {
-            success: false,
-            message: '红包页未获取到mktzb公众号openid，可手动打开授权一次或设置 HSJJ_MKTZB_OPENID；url=' + pageUrl
-        };
-    }
-
-    const form = new URLSearchParams({ prj_code: pagePrjCode, prj_urltag: prjUrltag, openid: pageOpenId }).toString();
-    const infoResp = await axios.post('https://www.mktzb.com/mktadmin/wcode/getCodeBaseInfo', form, { headers: formHeaders, timeout: 30000 });
-    if (debug) log('  [getCodeBaseInfo] ' + JSON.stringify(infoResp.data).substring(0, 300));
-    const codeInfo = infoResp.data?.value?.activityPrjCode || {};
-    const amount = codeInfo.user_bonus ? codeInfo.user_bonus / 100 : 0;
-    // mktzb 页面逻辑：
-    // if_used=2 表示红包发放中，if_used=3 表示领取成功；二者都不应当按失败处理。
-    if (String(codeInfo.if_used) === '2') return { success: true, data: infoResp.data, amount, message: '红包发放中' };
-    if (String(codeInfo.if_used) === '3') return { success: true, data: infoResp.data, amount, message: '红包已领取' };
-
-    const claimResp = await axios.post('https://www.mktzb.com/mktadmin/wcode/checkCodeBatchRepeat', form, { headers: formHeaders, timeout: 30000 });
-    if (debug) log('  [checkCodeBatchRepeat] ' + JSON.stringify(claimResp.data).substring(0, 300));
-    if (claimResp.data?.success) return { success: true, data: claimResp.data, amount };
-    // c0004 = 红包发放中，说明领取请求已经进入发放队列。
-    if (claimResp.data?.message === 'c0004') return { success: true, data: claimResp.data, amount, message: '红包发放中' };
-    return { success: false, message: JSON.stringify(claimResp.data) };
-}
-
-/**
- * 从活动信息的 exchangeRequestVoList 中补领历史未领取红包。
- * 参考 Python claim_existing_watch_rewards：遍历历史兑换记录，
- * 对每条有 ticketCode 的记录调用 updateRedPacketGetStatus + claimRedPacket。
- */
-async function claimExistingWatchRewards(session, wxid, cache, cacheKey, activityInfo) {
-    const rewards = activityInfo?.exchangeRequestVoList || [];
-    if (!rewards.length) return { claimed: 0, amount: 0 };
-
-    let claimedCount = 0;
-    let claimedAmount = 0;
-
-    for (const item of rewards) {
-        const requestId = item.requestId || item.redPacketRequestId || '';
-        if (!requestId) continue;
-
-        const ticketCode = item.ticketCode || item.tickCode || '';
-        const amount = Number(item.rewardAmount || 0);
-        const status = String(item.receiveStatus || '');
-
-        log(`  📦 发现历史红包: ${formatMoney(amount)}元, 券码: ${ticketCode || '无'}, receiveStatus=${status || '-'}`);
-
-        if (!AUTO_CLAIM_H5_RED_PACKET) continue;
-
-        // 更新红包领取状态
-        await updateRedPacketGetStatus(session.token, session.openId, session.userId, {
-            requestId,
-            activityId: item.activityId || '',
-            activityType: item.activityType || '4',
-        });
-
-        // 通过 H5 领取
-        if (ticketCode) {
-            const claimResult = await claimRedPacket(
-                session.token, session.openId, session.userId,
-                requestId, ticketCode, item.activityId, item.activityType,
-                '', wxid, cache, cacheKey
-            );
-            if (claimResult?.success) {
-                claimedCount++;
-                claimedAmount += claimResult.amount || amount;
-                log(`  ✅ 历史红包领取成功: ${formatMoney(claimResult.amount || amount)}元${claimResult.message ? ' (' + claimResult.message + ')' : ''}`);
-            } else {
-                log(`  ⚠️ 历史红包领取失败: ${claimResult?.message || '未知'}`);
-            }
-        }
-
-        await sleep(randomInt(500, 1500));
-    }
-
-    return { claimed: claimedCount, amount: claimedAmount };
 }
 
 // ==================== 单账号执行 ====================
@@ -1350,29 +1122,11 @@ async function runTask(accountInfo) {
         const activityEntry = await discoverActivityEntry(session.token, session.openId, session.userId);
         const roeResult = await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
 
-        // 8. 查询红包列表，领取红包
+        // 8. 查询红包列表与记录（只读，不再自动领取）
         await sleep(randomInt(1000, 2000));
         let redPacketAmount = 0;
         let pendingRedPacketAmount = 0;
         let roeReward = 0;
-        let claimedAmount = 0;
-        // 记录已领取的 requestId，避免 claimExistingWatchRewards 和 unclaimedList 重复领取
-        const claimedRequestIds = new Set();
-
-        // 从 ROE 兑换结果中提取已领取金额
-        if (roeResult?.existingClaim) {
-            claimedAmount += roeResult.existingClaim.amount || 0;
-            for (const item of (roeResult.activity?.exchangeRequestVoList || [])) {
-                const rid = item.requestId || item.redPacketRequestId || '';
-                if (rid) claimedRequestIds.add(rid);
-            }
-        }
-        if (roeResult?.claimResult?.success) {
-            claimedAmount += roeResult.claimResult.amount || 0;
-            const newRid = roeResult.data?.redPacketRequestId || roeResult.data?.requestId || '';
-            if (newRid) claimedRequestIds.add(newRid);
-        }
-
         // 获取红包活动列表
         const activities = await getActivityList(session.token, session.openId, session.userId);
         if (activities && activities.length > 0) {
@@ -1393,30 +1147,6 @@ async function runTask(accountInfo) {
                     const amount = Number(packet.amount || 0);
                     pendingRedPacketAmount += amount;
                     log('  🎯 未领红包: ' + (packet.describe || '') + ' 金额: ' + amount + '元 (ticketCode: ' + (packet.ticketCode || packet.requestId) + ')');
-
-                    // 自动提现：领取未领取红包（跳过已处理的）
-                    const pktRequestId = packet.requestId || '';
-                    if (AUTO_CLAIM_H5_RED_PACKET && packet.ticketCode && pktRequestId && !claimedRequestIds.has(pktRequestId)) {
-                        claimedRequestIds.add(pktRequestId);
-                        log('  💰 自动领取未领红包...');
-                        await updateRedPacketGetStatus(session.token, session.openId, session.userId, {
-                            requestId: pktRequestId,
-                            activityId: packet.activityId,
-                            activityType: packet.activityType || '4',
-                        });
-                        const pktClaim = await claimRedPacket(
-                            session.token, session.openId, session.userId,
-                            pktRequestId, packet.ticketCode, packet.activityId, packet.activityType,
-                            '', wxid, cache, cacheKey
-                        );
-                        if (pktClaim?.success) {
-                            claimedAmount += pktClaim.amount || amount;
-                            log('  ✅ 未领红包领取成功: ' + formatMoney(pktClaim.amount || amount) + '元' + (pktClaim.message ? ' (' + pktClaim.message + ')' : ''));
-                        } else {
-                            log('  ⚠️ 未领红包领取失败: ' + (pktClaim?.message || '未知'));
-                        }
-                        await sleep(randomInt(500, 1500));
-                    }
                 }
             }
         } else {
@@ -1448,10 +1178,7 @@ async function runTask(accountInfo) {
                 roeReward += roeResult.amount || 0;
             }
         }
-        if (claimedAmount > 0) {
-            log('  💰 本次自动提现领取: ' + formatMoney(claimedAmount) + '元');
-        }
-        return { success: true, currentPoint, roeReward, redPacketAmount, historyRedPacketAmount, pendingRedPacketAmount, claimedAmount };
+        return { success: true, currentPoint, roeReward, redPacketAmount, historyRedPacketAmount, pendingRedPacketAmount };
 
     } catch (e) {
         log('❌ 异常: ' + e.message);
@@ -1495,7 +1222,6 @@ async function main() {
                 accounts[i].redPacketAmount = result.redPacketAmount || 0;
                 accounts[i].historyRedPacketAmount = result.historyRedPacketAmount || 0;
                 accounts[i].pendingRedPacketAmount = result.pendingRedPacketAmount || 0;
-                accounts[i].claimedAmount = result.claimedAmount || 0;
             }
         } catch (e) {
             log('❌ 账号 ' + (i + 1) + ' 异常: ' + e.message);
@@ -1512,20 +1238,13 @@ async function main() {
 
     // 输出每个账号的汇总信息
     log('\n📋 账号汇总:');
-    let totalClaimed = 0;
     for (const account of accounts) {
         const display = account.note || account.wxid;
         const currentPoint = account.currentPoint || 0;
         const redPacketAmount = Math.max(account.historyRedPacketAmount || 0, account.redPacketAmount || 0);
         const pendingRedPacketAmount = account.pendingRedPacketAmount || 0;
-        const claimedAmount = account.claimedAmount || 0;
-        totalClaimed += claimedAmount;
-        log('当前账号: ' + display + ' 当前积分: ' + currentPoint + ' 当前总获得红包:' + formatMoney(redPacketAmount) + '元 当前未领红包: ' + formatMoney(pendingRedPacketAmount) + '元 本次自动提现: ' + formatMoney(claimedAmount) + '元');
+        log('当前账号: ' + display + ' 当前积分: ' + currentPoint + ' 当前总获得红包:' + formatMoney(redPacketAmount) + '元 当前未领红包: ' + formatMoney(pendingRedPacketAmount) + '元');
     }
-    if (totalClaimed > 0) {
-        log('\n💰 全部账号本次自动提现合计: ' + formatMoney(totalClaimed) + '元');
-    }
-
     // 推送通知
     await push_notification();
 }
