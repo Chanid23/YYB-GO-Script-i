@@ -310,6 +310,8 @@ function buildHeaders(data, token, encryptVer, openId, userId, appSecret, option
         'user_id': userId || '',
         'Referer': 'https://servicewechat.com/' + APPID + '/205/page-frame.html',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13) UnifiedPCWindowsWechat(0xf254186b) XWEB/19841',
+        'key_version': String(encryptVer || ''),
+        'openid': openId || '',
         'ticket': token || '',
     };
 }
@@ -781,11 +783,23 @@ async function doSign(session, wxid, cache, cacheKey) {
         log('  ⚠️ 签到encryptKey刷新失败，尝试缓存: ' + e.message);
         encryptKeyData = getEncryptKeyCache(cache, cacheKey);
     }
-    // HAR 中 userSignIn body 为 {"submitCode":"","requestId":""}，且需要 key_version/signature。
-    const resp = await apiRequest('POST', '/fundex-activity/point/sign/userSignIn', {
-        submitCode: '',
-        requestId: '',
-    }, token, encryptKeyData.version || '', openId, userId, encryptKeyData.encryptKey || '');
+    // 2026-10-28：服务端已把 userSignIn 纳入 SM4 加密名单，明文 body 会返回 7005/7006(02)。
+    let signPayload = { submitCode: '', requestId: '' };
+    if (encryptKeyData.encryptKey) {
+        try {
+            const kb = hexToBytes(Buffer.from(encryptKeyData.encryptKey, 'base64').toString('hex'));
+            if (kb.length === 16) {
+                signPayload = { msg: sm4Encrypt(JSON.stringify(signPayload), kb) };
+                log('  🔐 签到参数 SM4 加密完成');
+            } else {
+                log('  ⚠️ 签到 encryptKey 长度异常(' + kb.length + ')，明文提交');
+            }
+        } catch (e) {
+            log('  ⚠️ 签到参数加密失败: ' + e.message + '，明文提交');
+        }
+    }
+    const resp = await apiRequest('POST', '/fundex-activity/point/sign/userSignIn', signPayload,
+        token, encryptKeyData.version || '', openId, userId, encryptKeyData.encryptKey || '');
     if ((resp?.code === '429' || /访问过于频繁|请稍后再试/.test(resp?.msg || resp?.message || '')) && (session._sign429RetryCount || 0) < 3) {
         session._sign429RetryCount = (session._sign429RetryCount || 0) + 1;
         const waitMs = 5000 + randomInt(0, 2000) + (session._sign429RetryCount - 1) * 3000;
@@ -905,7 +919,15 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
     // - activitystatusResponseVo.activityId 才是 doExchange 兑换接口使用的真实活动 ID，例如 131003
     // 如果误用页面配置 ID，接口会返回“本次活动已结束”等误导性错误。
     const exchangeActivityId = activity?.activitystatusResponseVo?.activityId || activity.id;
-    let payload = { watchword: roeAnswer, openId: openId, activityId: exchangeActivityId };
+    // 2026-10-28：doExchange 必填 activityTemplateId / registerChannel，缺失即 400 参数异常。
+    const registerChannel = String((activityEntry && activityEntry.registerChannel) || buildDailyRegisterChannel()).replace(/^&/, '');
+    let payload = {
+        watchword: roeAnswer,
+        openId: openId,
+        activityId: exchangeActivityId,
+        activityTemplateId: Number(activity && activity.activityTemplateId ? activity.activityTemplateId : 0),
+        registerChannel: registerChannel,
+    };
     log('  🎯 兑换活动ID: ' + exchangeActivityId);
 
     // SM4加密
@@ -929,8 +951,7 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
     // 提交口令
     // 0624 抓包里 doExchange 的 register_channel 为空；
     // 渠道只用于发现页面入口，不强行带到兑换提交，避免 7005。
-    const registerChannel = '';
-    log('  🧭 提交渠道参数: 空(按抓包)');
+    log('  🧭 提交渠道参数: ' + registerChannel);
     const resp = await apiRequest(
         'POST',
         '/fundex-activity/watchWordCustom/doExchange',
