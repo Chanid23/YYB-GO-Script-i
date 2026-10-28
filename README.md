@@ -75,6 +75,10 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | JD Cookie同步 | `jd_cookie.py` |
 | 移动云盘（code版） | `ydyp_code.py` |
 
+> **太平洋蓝医保**（`tpylyb.py`）：2026-10-23 活动改版为「健康分 2.0」，接口迁至 `/asset-api/**` 并要求 `ua-encrypt`/`timestamp`/`nonce` 防篡改签名。
+> 支持早起打卡、健康问答、AI 识别三餐、AI 带你运动（自动化）与 AI 解读体检（提交后等医生审核）。
+> **素材不入库**：首次运行自动执行 `tpylyb_assets_bootstrap.py` 生成（下载餐食图 + 绘制体检报告，约 1-3 分钟，需外网；生成报告需 `pip install pillow`），落在 `wx-script/tpylyb_assets/`，已 gitignore。
+
 ## 独立脚本
 
 目录：`idp-script/`

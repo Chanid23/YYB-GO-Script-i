@@ -5,3 +5,8 @@ wxzftxbbs_account_info.json
 **/env_check.json
 json/
 node_modules/
+
+# 蓝医保运行时产物（本地生成，不入库）
+wx-script/tpylyb_assets/
+wx-script/tpylyb_state.json
+wx-script/tpylyb_answer_bank.json
