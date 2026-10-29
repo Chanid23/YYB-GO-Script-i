@@ -11,7 +11,7 @@ cron: 31 7,12 * * *
 修改作者：lcmovie https://github.com/lcmovie/YYB-GO-Script-i
 修改后主要适配：https://github.com/525815266/YYB-Go-Enhanced，实现无感取码，自动打卡 + 全部成长任务！
 ════════════════════════════════════════════════════════════════
-🌱 WorkBuddy Daily - 全能签到脚本 v3.22（YYB 无感取码版）
+🌱 WorkBuddy Daily - 全能签到脚本 v3.26（YYB 无感取码版）
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -71,6 +71,8 @@ cron: 31 7,12 * * *
                         【可选】补偿/礼包本地期次防重文件路径
    WORKBUDDY_ACTIVITY_CHAT_FALLBACK
                         【可选】每日活跃合成事件未计分时，用一次真实对话兜底（默认 1）
+   WORKBUDDY_NOTIFY     【可选】推送策略：always（默认，每次推）/ fail（仅异常时推）/ 0（关闭）
+   WORKBUDDY_STATE_DIR  【可选】状态文件目录（活跃去重 / 礼包补偿防重）；默认脚本同级目录
    PUSH_PLUS_TOKEN / PLUSPLUS_TOKEN / PUSH_KEY / QYWX_KEY / BARK_PUSH
                         【可选】脚本自带通知通道（青龙 notify.py 未配置时回落）
 
@@ -114,6 +116,9 @@ cron: 31 7,12 * * *
    · 专家任务：expert_use_* 族动态发现（jump_url 深链优先、专家市场按 ID 精确落位）
    · PC 灵感：Sequential_Tasks_7 走桌面 playbook 事件链（对话链 + cta_click + prompt_send）
    · 任务发现：桌面 /v2 + 小程序 /v2 + 等级族 /activity 三源合并去重
+   · 未下发任务：accept_status 为 None（已下线/未开放）直接跳过，不发对话不白扣积分
+   · mp 延迟 target：accept 后 target 未下发时有界回读（30×2.5s），仍空则留待下一轮不冒领
+   · 推送策略：WORKBUDDY_NOTIFY=always（默认）/ fail（仅异常）/ 0（关闭）
 
 📄 依赖：requests（pip3 install requests）
 
@@ -152,7 +157,7 @@ try:
 except Exception:
     pass
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 APP_ID = "wx907c65e5e107ddcf"                     # WorkBuddy 小程序 AppID
 LOGIN_URL = "https://www.codebuddy.cn/v2/plugin/login/token"
 PROFILE_URL = "https://www.codebuddy.cn/v2/as/wechatmp/user/profile"
@@ -170,6 +175,25 @@ HEADERS = {
     "Origin": BASE,
     "Referer": BASE + "/profile/growth-center",
 }
+
+
+def _state_dir():
+    """状态文件目录：`WORKBUDDY_STATE_DIR` 优先，未设置时用脚本同级目录（原行为）。
+
+    需要把状态放进数据卷/持久目录时（容器、只读的脚本目录、面板类调度器升级会
+    覆盖脚本目录）设这个变量，避免状态文件随脚本一起被替换。
+    """
+    custom = os.environ.get("WORKBUDDY_STATE_DIR", "").strip()
+    if custom:
+        try:
+            os.makedirs(custom, exist_ok=True)
+        except Exception:
+            pass
+        return custom
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+STATE_DIR = _state_dir()
 
 _SETUP_DATA = (
     "eJw9zUEOwiAQheG7sG46hZpGu/UYpgsKJE5aQWEA0Xh3CSZuvsX/kpk3i35nM7sS3cMMkHPus/"
@@ -367,6 +391,8 @@ PLAYBOOK_CASE = {"id": "01-ProductDesign", "name": "产品设计", "type": "docu
 
 WRITE_GAP = 1.5  # 写动作间隔秒数（--gap 可覆盖，最低 1.0）
 MP_CHAT_GAP = 45.0  # mp 对话事件“真人节奏”间隔秒数（上游实测 45s；--mp-gap / WORKBUDDY_MP_GAP 可覆盖）
+MP_TARGET_WAIT_ROUNDS = 30
+MP_TARGET_WAIT_SECONDS = 2.5
 
 
 def _parse_task_filter(raw):
@@ -1356,7 +1382,7 @@ def t_daily_activity(s, uid, nick, log):
     HTTP 200 只代表事件已受理，必须由热力图 score 确认真正计分后才写本地标记。
     """
     state_file = os.getenv("WORKBUDDY_ACTIVITY_STATE", "").strip() or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "workbuddy_activity_state.json")
+        STATE_DIR, "workbuddy_activity_state.json")
     today = beijing_today().isoformat()
     state = {}
     try:
@@ -1569,6 +1595,10 @@ def t_team_3(s, uid, nick, log):
 def t_buddy_apps(s, uid, nick, log):
     for task in ("Buddy_App", "Buddy_App_QQ"):
         st, cur, tgt = prog(s, task)
+        if st is None:
+            # 未下发（如 Buddy_App_QQ 已下线）→ 不发 buddyapp 五连
+            log("   %s: 当前任务列表未下发（可能已下线），跳过" % task)
+            continue
         if st in ("completed", "claimed"):
             continue
         buddy_id = QQ_TPL if "QQ" in task else "buddy-app-default"
@@ -1635,6 +1665,11 @@ def t_library(s, uid, nick, log):
 
 
 def t_chat_n(s, uid, nick, log, code, n, prompts):
+    st0, _c, _t = prog(s, code)
+    if st0 is None:
+        # 任务未下发（已下线/未开放）：继续发真实对话只会白扣积分
+        log("   %s: 当前任务列表未下发（可能已下线），跳过" % code)
+        return
     for i in range(n):
         st, cur, tgt = prog(s, code)
         if st in ("completed", "claimed") or (cur or 0) >= (tgt or n):
@@ -1650,6 +1685,9 @@ def t_chat_n(s, uid, nick, log, code, n, prompts):
 
 def t_black_cat(s, uid, nick, log):
     st, cur, tgt = prog(s, "black_cat")
+    if st is None:
+        log("   夜猫子: 当前任务列表未下发 black_cat（可能已下线），跳过")
+        return
     if st in ("completed", "claimed"):
         log("   夜猫子: 已 %s %s/%s" % (st, cur, tgt))
         return
@@ -1747,7 +1785,10 @@ def _desktop_run(s, uid, nick, conv_name, prompt, extra_events):
 
 
 def t_canvas_automation(s, uid, nick, log):
-    if prog(s, "create_canvas")[0] not in ("completed", "claimed"):
+    canvas_st = prog(s, "create_canvas")[0]
+    if canvas_st is None:
+        log("   设计创意画布: 当前任务列表未下发（可能已下线），跳过")
+    elif canvas_st not in ("completed", "claimed"):
         def _canvas_evs(cid, mid):
             return [{"eventCode": "wbx_design_canvas_task_create", "conversationId": cid, "requestId": mid,
                      "source": "summon_keyword", "isCustomModel": False, "name": "", "inputLength": 12,
@@ -1762,7 +1803,9 @@ def t_canvas_automation(s, uid, nick, log):
                                   {"eventCode": "wbx_design_canvas_task_create"}])
             time.sleep(3)
     st, cur, tgt = prog(s, "automation_1")
-    if st not in ("completed", "claimed"):
+    if st is None:
+        log("   自动化任务: 当前任务列表未下发（可能已下线），跳过")
+    elif st not in ("completed", "claimed"):
         report(s, uid, nick, [{"eventCode": "agent_task_created", "source": "CLOUD", "name": "", "mode": "craft",
                                "requestModelId": "default", "task_mode": "automation",
                                "isAutomationBackground": True},
@@ -1778,7 +1821,10 @@ def t_canvas_automation(s, uid, nick, log):
                                "prompt": "每周五自动整理本周工作，生成一份周报。"},
                               {"eventCode": "automated_task_execute", "action": "execute"}])
         time.sleep(3)
-    if prog(s, "playbook_prompt")[0] not in ("completed", "claimed"):
+    playbook_st = prog(s, "playbook_prompt")[0]
+    if playbook_st is None:
+        log("   优秀灵感: 当前任务列表未下发（可能已下线），跳过")
+    elif playbook_st not in ("completed", "claimed"):
         def _pb_evs(cid, mid):
             payload = {"id": PLAYBOOK_CASE["id"], "name": PLAYBOOK_CASE["name"],
                        "type": PLAYBOOK_CASE["type"], "categoryId": "", "categoryName": ""}
@@ -1994,8 +2040,7 @@ def t_badges(s, uid, nick, log):
         pass
 
 
-BENEFIT_STATE_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "workbuddy_benefit_state.json")
+BENEFIT_STATE_FILE = os.path.join(STATE_DIR, "workbuddy_benefit_state.json")
 
 
 def _benefit_state_path():
@@ -2771,6 +2816,19 @@ def _mp_task_row(s, code):
     return None
 
 
+def _wait_mp_target(s, code, label, log):
+    """accept 后 target<=0 表示进度尚未下发；有界回读，禁止按 1 冒领。"""
+    for _ in range(max(1, MP_TARGET_WAIT_ROUNDS)):
+        time.sleep(max(0.0, MP_TARGET_WAIT_SECONDS))
+        status, current, target = _mp_prog(s, code)
+        if status in ("completed", "claimed"):
+            return status, current, target
+        if target is not None and target > 0:
+            return status, current, target
+    log("   %s: target 仍未下发，留待下一轮，不按 1 冒领" % label)
+    return None
+
+
 def _mp_do_task(s, uid, nick, code, log, events_fn, label, target=1, pace=False):
     """小程序任务通用流程：mp 查询 → accept → 判据上报 → 回读 → claim。
 
@@ -2814,9 +2872,23 @@ def _mp_do_task(s, uid, nick, code, log, events_fn, label, target=1, pace=False)
             else:
                 log("   %s: 已领取，跳过" % label)
             return
-    # 缺口计算：cur 可能为 None（未激活时 progress 全空）→ 用 target 兜底
+    # target<=0 = 进度尚未下发，不能按 1 猜；有界回读后仍为空则留到下一轮。
+    if tgt is None or tgt <= 0:
+        state = _wait_mp_target(s, code, label, log)
+        if state is None:
+            return
+        st, cur, tgt = state
+        if st in ("completed", "claimed"):
+            if st == "completed":
+                _mp_claim(s, code, log)
+            else:
+                log("   %s: 已领取，跳过" % label)
+            return
+    # 缺口计算：cur 可能为 None（未激活时 progress 全空）
     cur = cur or 0
-    tgt = tgt or target
+    if tgt is None or tgt <= 0:
+        log("   %s: target 无效，跳过" % label)
+        return
     need = max(1, tgt - cur)
     try:
         sent = 0
@@ -3805,6 +3877,7 @@ def run_account(idx, client, account, do_desktop):
         checkin_line, checkin_ok = client.run_checkin()
         log("   %s" % checkin_line)
         summary["checked"] = checkin_ok
+        summary["checked_in"] = bool(checkin_ok)
         summary["checkin"] = checkin_line
         try:
             st_data = client.status()
@@ -3857,8 +3930,13 @@ def run_account(idx, client, account, do_desktop):
         log("      ℹ️ 活跃连签=0 属正常：它由成长中心「使用事件（热力墙）」驱动，与积分签到无关")
 
     # 桌面任务（非 Windows 自动降级为指纹上报）
-    need_rich = prog(s, "RichMeow_Chat")[0] not in ("completed", "claimed")
-    need_skill = prog(s, "skill_1")[0] not in ("completed", "claimed")
+    rich_st = prog(s, "RichMeow_Chat")[0]
+    skill_st = prog(s, "skill_1")[0]
+    # 未下发（None）＝该任务当前不可做：不能当「未完成」去跑桌面对话，否则白扣积分
+    need_rich = rich_st is not None and rich_st not in ("completed", "claimed")
+    need_skill = skill_st is not None and skill_st not in ("completed", "claimed")
+    if rich_st is None or skill_st is None:
+        log("  🖥️ 桌面任务: 有任务未下发（RichMeow=%s skill_1=%s），未下发项不执行" % (rich_st, skill_st))
     desktop_skipped = False
     if (need_rich or need_skill) and not want("desktop", "RichMeow_Chat", "skill_1"):
         log("  🖥️ 桌面任务: 按配置跳过（desktop）")
@@ -4139,6 +4217,39 @@ def print_banner(query=False):
     print("📦 v%s · %s" % (VERSION, "签到状态查询" if query else "全流程"), flush=True)
 
 
+def _notify_ok(summaries):
+    """本轮是否「一切正常」。
+
+    判据只看签到结论：成功分支（含幂等命中「今天已签到」）会写 checked_in=True。
+    账号级异常中断（run_account 抛错）也视为不正常——那种 summary 没有
+    checked_in 字段，自然落到 False。
+    """
+    if not summaries:
+        return False
+    return all(bool(sm.get("checked_in")) for sm in summaries)
+
+
+def _notify_or_skip(summaries, summary_text, blocked=False):
+    """按 WORKBUDDY_NOTIFY 策略决定是否推送。
+
+    always（默认，保持原行为）  每次运行都推
+    fail                        仅本轮不「一切正常」时推
+    0 / off / none              完全不推
+    """
+    if blocked:          # --no-notify / WB_NO_NOTIFY=1
+        return
+    mode = (os.environ.get("WORKBUDDY_NOTIFY") or "always").strip().lower()
+    if mode in ("0", "off", "no", "false", "none"):
+        return
+    if mode == "fail" and _notify_ok(summaries):
+        print("ℹ️ 本轮无异常，按 WORKBUDDY_NOTIFY=fail 跳过推送", flush=True)
+        return
+    try:
+        send_notify("🌱 WorkBuddy 签到报告", summary_text)
+    except Exception as exc:
+        print("⚠️ 通知发送异常（不影响结果）：%s" % str(exc)[:160], flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="WorkBuddy YYB 全能签到")
     parser.add_argument("--only", default=os.getenv("WB_ACCOUNT_FILTER", ""), metavar="3,4,5")
@@ -4241,10 +4352,9 @@ def main(argv=None):
     print("⏱️ 运行耗时 %.1f 秒" % elapsed, flush=True)
 
     if not args.no_notify and os.getenv("WB_NO_NOTIFY") != "1":
-        try:
-            send_notify("🌱 WorkBuddy 签到报告", summary_text)
-        except Exception as exc:
-            print("⚠️ 通知发送异常（不影响结果）：%s" % str(exc)[:160], flush=True)
+        _notify_or_skip(reports, summary_text)
+    else:
+        _notify_or_skip(reports, summary_text, blocked=True)
 
     ok = sum(1 for r in reports if not r.get("error"))
     return 0 if total > 0 and ok == total and not errors else 1
