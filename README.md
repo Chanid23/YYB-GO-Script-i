@@ -50,7 +50,6 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 小米社区签到 | `miqd.py` |
 | 中通快递 | `ztkd.py` |
 | 平安i动签到 | `paid.js` |
-| 京东快递 | `jdkd.py` |
 | 长虹智慧家 | `chzhjj.py` |
 | 创维 | `cw.js` |
 | QQ音乐签到 | `qqmusic.py` |
